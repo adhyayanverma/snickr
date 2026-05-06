@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Register – snickr{% endblock %}
+{% block body %}
+<div class="full-center" style="background: var(--bg);">
+  <div class="auth-box">
+    <div class="auth-logo">sni<span>ckr</span></div>
+    <div class="auth-tagline">create your account</div>
+
+    {% for cat, msg in get_flashed_messages(with_categories=True) %}
+      <div class="alert alert-{{ cat }}" style="margin-bottom:12px">{{ msg }}</div>
+    {% endfor %}
+
+    <form method="post" action="{{ url_for('register') }}">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" name="username" required autofocus placeholder="alice" pattern="[a-zA-Z0-9_]{3,50}">
+      </div>
+      <div class="form-group">
+        <label>Email</label>
+        <input type="email" name="email" required placeholder="alice@example.com">
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" name="password" required minlength="6" placeholder="min 6 characters">
+      </div>
+      <div class="form-group">
+        <label>Confirm Password</label>
+        <input type="password" name="confirm" required placeholder="••••••••">
+      </div>
+      <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">
+        Create account →
+      </button>
+    </form>
+
+    <div style="text-align:center;margin-top:18px;color:var(--muted);font-size:13px">
+      Already have an account? <a href="{{ url_for('login') }}">Sign in</a>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Search – snickr{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <span class="topbar-title">Search</span>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="page-body">
+  <form method="get" action="{{ url_for('search') }}" style="margin-bottom:20px">
+    <div style="display:flex;gap:10px;align-items:flex-end">
+      <div class="form-group" style="flex:1;margin-bottom:0">
+        <label>Keyword</label>
+        <input type="text" name="q" value="{{ q }}" placeholder="search messages…" autofocus>
+      </div>
+      <div class="form-group" style="width:200px;margin-bottom:0">
+        <label>Workspace</label>
+        <select name="ws_id">
+          <option value="">All workspaces</option>
+          {% for ws in workspaces %}
+            <option value="{{ ws.workspace_id }}"
+              {% if selected_ws == ws.workspace_id %}selected{% endif %}>
+              {{ ws.name }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+      <button type="submit" class="btn btn-primary">Search →</button>
+    </div>
+  </form>
+
+  {% if q %}
+    {% if results %}
+      <div style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px">
+        {{ results|length }} result{{ 's' if results|length != 1 else '' }} for "{{ q }}"
+      </div>
+      {% for r in results %}
+        <div class="search-result">
+          <div class="search-result-meta">
+            <a href="{{ url_for('channel', ws_id=r.workspace_id, ch_id=r.channel_id) }}"
+               style="color:var(--accent)">
+              #{{ r.channel_name }}
+            </a>
+            in <strong>{{ r.workspace_name }}</strong> ·
+            {{ r.author }} ·
+            {{ r.created_at.strftime('%b %d, %Y %H:%M') }}
+          </div>
+          <div class="search-result-content">{{ r.content }}</div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div style="text-align:center;padding:40px 0;color:var(--muted)">
+        <div style="font-family:var(--mono);margin-bottom:8px">No results for "{{ q }}"</div>
+        <div style="font-size:12px">Try different keywords.</div>
+      </div>
+    {% endif %}
+  {% else %}
+    <div style="text-align:center;padding:60px 0;color:var(--muted)">
+      <div style="font-size:36px;margin-bottom:12px">⌕</div>
+      <div style="font-family:var(--mono)">Search messages across your channels.</div>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

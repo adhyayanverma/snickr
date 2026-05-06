@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}{{ ws.name }} – snickr{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:10px">
+    <div style="width:28px;height:28px;border-radius:6px;background:var(--accent2);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-weight:700;font-size:13px;color:#fff">
+      {{ ws.name[0].upper() }}
+    </div>
+    <span class="topbar-title">{{ ws.name }}</span>
+    {% if is_admin %}
+      <span style="font-family:var(--mono);font-size:9px;color:var(--warning);text-transform:uppercase;letter-spacing:1px">admin</span>
+    {% endif %}
+  </div>
+  <div class="topbar-right">
+    <a href="{{ url_for('search') }}?ws_id={{ ws.workspace_id }}" class="btn btn-sm btn-secondary">⌕ Search</a>
+    {% if is_admin %}
+      <button class="btn btn-sm btn-secondary" onclick="openModal('modal-add-member')">+ Add Member</button>
+      <a href="{{ url_for('new_channel', ws_id=ws.workspace_id) }}" class="btn btn-sm btn-primary">+ Channel</a>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="page-body" style="display:grid;grid-template-columns:1fr 260px;gap:20px;height:100%">
+
+  <!-- Channels -->
+  <div>
+    <div style="font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:12px">
+      Channels
+    </div>
+    {% if channels %}
+      <div class="channel-grid">
+        {% for ch in channels %}
+          <div class="channel-card" style="position:relative">
+            {% if ch.is_member %}
+              <a href="{{ url_for('channel', ws_id=ws.workspace_id, ch_id=ch.channel_id) }}"
+                 style="position:absolute;inset:0;z-index:1"></a>
+            {% endif %}
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <div class="channel-card-name">{{ ch.name }}</div>
+              <span class="chip chip-{{ ch.channel_type }}">{{ ch.channel_type }}</span>
+            </div>
+            {% if ch.description %}
+              <div class="channel-card-desc">{{ ch.description }}</div>
+            {% endif %}
+            <div class="channel-card-meta">
+              <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">
+                ✉ {{ ch.msg_count }}
+              </span>
+              {% if ch.is_member %}
+                <span style="font-family:var(--mono);font-size:10px;color:var(--success)">✓ member</span>
+              {% elif ch.channel_type == 'public' %}
+                <form method="post"
+                      action="{{ url_for('join_channel', ws_id=ws.workspace_id, ch_id=ch.channel_id) }}"
+                      style="z-index:2;position:relative">
+                  <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                  <button type="submit" class="btn btn-sm btn-secondary">Join</button>
+                </form>
+              {% else %}
+                <span style="font-family:var(--mono);font-size:10px;color:var(--muted)">invite only</span>
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div style="color:var(--muted);padding:24px 0">No channels yet.</div>
+    {% endif %}
+  </div>
+
+  <!-- Members sidebar -->
+  <div>
+    <div style="font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:12px">
+      Members ({{ members|length }})
+    </div>
+      {% for m in members %}
+      <div class="member-row">
+        <div class="avatar">{{ m.username[0].upper() }}</div>
+        <div style="overflow:hidden">
+          <div style="font-family:var(--mono);font-size:12px;color:var(--muted)">@{{ m.username }}</div>
+        </div>
+        {% if m.is_admin %}
+          <span style="margin-left:auto;font-family:var(--mono);font-size:9px;color:var(--warning)">ADMIN</span>
+        {% endif %}
+      </div>
+      {% endfor %}
+
+    {% if ws.description %}
+      <div style="margin-top:20px;padding:12px;background:var(--bg3);border-radius:6px;font-size:12px;color:var(--muted);line-height:1.5">
+        {{ ws.description }}
+      </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Add member modal -->
+{% if is_admin %}
+<div class="modal-backdrop" id="modal-add-member">
+  <div class="modal">
+    <span class="modal-close" onclick="closeModal('modal-add-member')">✕</span>
+    <div class="modal-title">Add Member</div>
+    <form method="post" action="{{ url_for('add_workspace_member', ws_id=ws.workspace_id) }}">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" name="username" required placeholder="e.g. alice" autofocus>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button type="button" class="btn btn-secondary" onclick="closeModal('modal-add-member')">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add →</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}New Workspace – snickr{% endblock %}
+{% block topbar %}
+<div class="topbar"><span class="topbar-title">New Workspace</span></div>
+{% endblock %}
+{% block content %}
+<div class="page-body" style="max-width:480px">
+  <div class="card">
+    <div style="font-family:var(--mono);font-size:14px;font-weight:700;margin-bottom:16px">
+      Create a Workspace
+    </div>
+    <form method="post" action="{{ url_for('new_workspace') }}">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div class="form-group">
+        <label>Workspace Name</label>
+        <input type="text" name="name" required autofocus placeholder="e.g. Acme Engineering">
+      </div>
+      <div class="form-group">
+        <label>Description (optional)</label>
+        <textarea name="description" placeholder="What is this workspace for?"></textarea>
+      </div>
+      <div style="display:flex;gap:8px">
+        <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancel</a>
+        <button type="submit" class="btn btn-primary">Create →</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

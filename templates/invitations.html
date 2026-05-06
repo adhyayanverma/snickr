@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Invitations – snickr{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <span class="topbar-title">Invitations</span>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="page-body">
+  {% if not invites %}
+    <div style="text-align:center;padding:60px 0;color:var(--muted)">
+      <div style="font-size:36px;margin-bottom:12px">✉</div>
+      <div style="font-family:var(--mono)">No invitations.</div>
+    </div>
+  {% else %}
+    {% for inv in invites %}
+      <div class="card" style="display:flex;align-items:center;gap:16px;padding:16px 20px">
+        <div style="flex:1">
+          <div style="font-weight:500;margin-bottom:4px">
+            <span style="color:var(--muted)">Invited to</span>
+            <span style="font-family:var(--mono)">#{{ inv.channel_name }}</span>
+            <span style="color:var(--muted)">in</span>
+            <strong>{{ inv.workspace_name }}</strong>
+          </div>
+          <div style="font-size:12px;color:var(--muted)">
+            From {{ inv.invited_by_name }} ·
+            {{ inv.created_at.strftime('%b %d, %Y') }} ·
+            <span class="chip chip-{{ inv.channel_type }}">{{ inv.channel_type }}</span>
+          </div>
+        </div>
+        <div>
+          {% if inv.status == 'pending' %}
+            <form method="post"
+                  action="{{ url_for('respond_invitation', inv_id=inv.invitation_id) }}"
+                  style="display:flex;gap:8px">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" name="action" value="accept" class="btn btn-primary btn-sm">Accept</button>
+              <button type="submit" name="action" value="decline" class="btn btn-secondary btn-sm">Decline</button>
+            </form>
+          {% elif inv.status == 'accepted' %}
+            <span style="font-family:var(--mono);font-size:11px;color:var(--success)">✓ Accepted</span>
+          {% else %}
+            <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">Declined</span>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  {% endif %}
+</div>
+{% endblock %}
