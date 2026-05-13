@@ -6,16 +6,178 @@
   <span class="icon" style="color:var(--muted)">#</span>
   <span class="topbar-title">{{ ch.name }}</span>
   <span class="chip chip-{{ ch.channel_type }}" style="margin-left:4px">{{ ch.channel_type }}</span>
-  {% if ch.description %}
-    <span class="topbar-sub">{{ ch.description }}</span>
-  {% endif %}
+  {% if ch.description %}<span class="topbar-sub">{{ ch.description }}</span>{% endif %}
   <div class="topbar-right">
+    {% if pinned %}
+    <button class="btn btn-sm btn-secondary" onclick="openModal('modal-pins')">📌 {{ pinned|length }} pinned</button>
+    {% endif %}
     {% if is_member and ws_members %}
-      <button class="btn btn-sm btn-secondary" onclick="openModal('modal-invite')">✉ Invite</button>
+    <button class="btn btn-sm btn-secondary" onclick="openModal('modal-invite')">✉ Invite</button>
     {% endif %}
     <a href="{{ url_for('workspace', ws_id=ws_id) }}" class="btn btn-sm btn-ghost">← {{ ch.workspace_name }}</a>
   </div>
 </div>
+{% endblock %}
+
+{% block head %}
+<style>
+  .reaction-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--bg3);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13px;
+    transition: border-color .15s, background .15s;
+  }
+
+  .reaction-btn:hover {
+    border-color: var(--accent);
+    background: var(--bg2);
+  }
+
+  .reaction-btn.reacted {
+    border-color: var(--accent);
+    background: rgba(79, 142, 247, .15);
+  }
+
+  .reaction-count {
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--muted);
+  }
+
+  .emoji-picker {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    position: relative;
+    z-index: 10;
+  }
+
+  .emoji-opt {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 18px;
+    padding: 3px;
+    border-radius: 4px;
+    transition: background .1s;
+  }
+
+  .emoji-opt:hover {
+    background: var(--bg3);
+  }
+
+  /* ── Attachment styles ── */
+  .attachment-block {
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    max-width: 420px;
+  }
+
+  .attachment-image {
+    display: block;
+    max-width: 100%;
+    max-height: 320px;
+    object-fit: contain;
+    background: var(--bg);
+    cursor: pointer;
+  }
+
+  .attachment-file {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--bg3);
+  }
+
+  .attachment-icon {
+    font-size: 24px;
+    flex-shrink: 0;
+  }
+
+  .attachment-meta {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .attachment-name {
+    font-weight: 500;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .attachment-size {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+  }
+
+  /* ── Compose file preview ── */
+  #file-preview {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--bg3);
+    border: 1px dashed var(--accent);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    font-size: 12px;
+  }
+
+  #file-preview .fname {
+    font-weight: 500;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Lightbox */
+  #lightbox {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .85);
+    z-index: 200;
+    justify-content: center;
+    align-items: center;
+  }
+
+  #lightbox.open {
+    display: flex;
+  }
+
+  #lightbox img {
+    max-width: 90vw;
+    max-height: 90vh;
+    border-radius: 6px;
+  }
+
+  #lightbox-close {
+    position: absolute;
+    top: 20px;
+    right: 24px;
+    color: #fff;
+    font-size: 28px;
+    cursor: pointer;
+  }
+</style>
 {% endblock %}
 
 {% block content %}
@@ -24,91 +186,234 @@
   <!-- Message list -->
   <div id="msg-list" style="flex:1;overflow-y:auto;padding:12px 24px">
     {% if not messages %}
-      <div style="text-align:center;padding:60px 0;color:var(--muted)">
-        <div style="font-size:36px;margin-bottom:12px">💬</div>
-        <div style="font-family:var(--mono)">No messages yet.</div>
-        {% if is_member %}
-          <div style="margin-top:8px;font-size:12px">Be the first to say something!</div>
-        {% endif %}
-      </div>
+    <div style="text-align:center;padding:60px 0;color:var(--muted)">
+      <div style="font-size:36px;margin-bottom:12px">💬</div>
+      <div style="font-family:var(--mono)">No messages yet.</div>
+      {% if is_member %}<div style="margin-top:8px;font-size:12px">Be the first to say something!</div>{% endif %}
+    </div>
     {% else %}
-      <div class="msg-list">
-        {% for m in messages %}
-          <div class="msg" id="msg-{{ m.message_id }}">
-            <div class="msg-avatar">{{ m.username[0].upper() }}</div>
-            <div class="msg-body">
-              <div class="msg-header">
-                <span class="msg-author">{{ m.username }}</span>
-                <span class="msg-time" title="{{ m.created_at }}">
-                  {{ m.created_at.strftime('%b %d, %H:%M') }}
-                </span>
-              </div>
-              <div class="msg-text" id="text-{{ m.message_id }}">
-                {{ m.content }}
-                {% if m.edited_at %}
-                  <span class="edited">(edited)</span>
-                {% endif %}
-              </div>
+    <div class="msg-list">
+      {% for m in messages %}
+      <div class="msg" id="msg-{{ m.message_id }}">
+        <div class="msg-avatar">{{ m.username[0].upper() }}</div>
+        <div class="msg-body">
+          <div class="msg-header">
+            <span class="msg-author">{{ m.username }}</span>
+            <span class="msg-time" title="{{ m.created_at }}">{{ m.created_at.strftime('%b %d, %H:%M') }}</span>
+            {% if m.message_id in pinned_ids %}<span style="font-size:11px" title="Pinned">📌</span>{% endif %}
+          </div>
 
+          <div class="msg-text" id="text-{{ m.message_id }}">
+            <span class="msg-content">{{ m.content }}</span>
+            {% if m.edited_at %}<span class="edited">(edited)</span>{% endif %}
+          </div>
+
+          {# ── Attachment rendering ── #}
+          {% set att = attachments.get(m.message_id) %}
+          {% if att %}
+          <div class="attachment-block">
+            {% set ext = att.stored_name.rsplit('.', 1)[-1].lower() %}
+            {% if ext in ['jpg','jpeg','png','gif','webp','svg'] %}
+            {# Image: show inline preview with lightbox #}
+            <img class="attachment-image" src="{{ url_for('serve_attachment', stored_name=att.stored_name) }}"
+              alt="{{ att.original_name }}" onclick="openLightbox(this.src)" title="Click to expand">
+            <div class="attachment-file" style="border-top:1px solid var(--border)">
+              <div class="attachment-meta">
+                <div class="attachment-name">{{ att.original_name }}</div>
+                <div class="attachment-size">{{ (att.file_size_bytes / 1024) | round(1) }} KB</div>
+              </div>
+              <a href="{{ url_for('serve_attachment', stored_name=att.stored_name) }}"
+                download="{{ att.original_name }}" class="btn btn-ghost btn-sm">↓ Download</a>
               {% if m.user_id == session.get('user_id') %}
-                <div class="msg-actions">
-                  <button class="btn btn-ghost btn-sm"
-                          onclick="startEdit({{ m.message_id }})">Edit</button>
-                  <form method="post"
-                        action="{{ url_for('delete_message', ws_id=ws_id, ch_id=ch.channel_id, msg_id=m.message_id) }}"
-                        onsubmit="return confirm('Delete this message?')">
-                    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                    <button type="submit" class="btn btn-ghost btn-sm" style="color:var(--danger)">Delete</button>
-                  </form>
-                </div>
-                <!-- Inline edit form (hidden by default) -->
-                <form method="post"
-                      action="{{ url_for('edit_message', ws_id=ws_id, ch_id=ch.channel_id, msg_id=m.message_id) }}"
-                      id="edit-form-{{ m.message_id }}"
-                      style="display:none;margin-top:6px">
-                  <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                  <div style="display:flex;gap:6px">
-                    <input type="text" name="content" value="{{ m.content }}" required
-                           style="flex:1" id="edit-input-{{ m.message_id }}">
-                    <button type="submit" class="btn btn-sm btn-primary">Save</button>
-                    <button type="button" class="btn btn-sm btn-secondary"
-                            onclick="cancelEdit({{ m.message_id }})">✕</button>
-                  </div>
-                </form>
+              <form method="post"
+                action="{{ url_for('delete_attachment', ws_id=ws_id, ch_id=ch.channel_id, att_id=att.attachment_id) }}"
+                onsubmit="return confirm('Remove attachment?')">
+                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-ghost btn-sm" style="color:var(--danger)">✕</button>
+              </form>
               {% endif %}
             </div>
+            {% else %}
+            {# Non-image: file card #}
+            <div class="attachment-file">
+              <div class="attachment-icon">
+                {% if ext == 'pdf' %}📄
+                {% elif ext in ['zip'] %}🗜️
+                {% elif ext in ['py','js','html','css','sql'] %}💻
+                {% elif ext in ['csv','json'] %}📊
+                {% else %}📎{% endif %}
+              </div>
+              <div class="attachment-meta">
+                <div class="attachment-name">{{ att.original_name }}</div>
+                <div class="attachment-size">
+                  {{ att.mime_type }} ·
+                  {% if att.file_size_bytes >= 1048576 %}
+                  {{ (att.file_size_bytes / 1048576) | round(1) }} MB
+                  {% else %}
+                  {{ (att.file_size_bytes / 1024) | round(1) }} KB
+                  {% endif %}
+                </div>
+              </div>
+              <a href="{{ url_for('serve_attachment', stored_name=att.stored_name) }}"
+                download="{{ att.original_name }}" class="btn btn-secondary btn-sm">↓ Download</a>
+              {% if m.user_id == session.get('user_id') %}
+              <form method="post"
+                action="{{ url_for('delete_attachment', ws_id=ws_id, ch_id=ch.channel_id, att_id=att.attachment_id) }}"
+                onsubmit="return confirm('Remove attachment?')">
+                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-ghost btn-sm" style="color:var(--danger)">✕</button>
+              </form>
+              {% endif %}
+            </div>
+            {% endif %}
           </div>
-        {% endfor %}
+          {% endif %}
+
+          {# ── Reactions ── #}
+          {% set msg_reactions = reactions.get(m.message_id, []) %}
+          {% if msg_reactions or is_member %}
+          <div class="reactions-row" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;align-items:center">
+            {% for r in msg_reactions %}
+            <form method="post"
+              action="{{ url_for('toggle_reaction', ws_id=ws_id, ch_id=ch.channel_id, msg_id=m.message_id) }}"
+              style="display:inline">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="emoji" value="{{ r.emoji }}">
+              <button type="submit" class="reaction-btn {% if r.reacted_by_me %}reacted{% endif %}">
+                {{ r.emoji }} <span class="reaction-count">{{ r.count }}</span>
+              </button>
+            </form>
+            {% endfor %}
+            {% if is_member %}
+            <button class="btn btn-ghost btn-sm" style="font-size:14px;padding:2px 6px;opacity:.5"
+              onclick="togglePicker({{ m.message_id }})">＋😀</button>
+            <div class="emoji-picker" id="picker-{{ m.message_id }}" style="display:none">
+              {% for e in ["👍","👎","❤️","😂","🎉","🚀","👀","🔥","✅","😮"] %}
+              <form method="post"
+                action="{{ url_for('toggle_reaction', ws_id=ws_id, ch_id=ch.channel_id, msg_id=m.message_id) }}"
+                style="display:inline">
+                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="emoji" value="{{ e }}">
+                <button type="submit" class="emoji-opt">{{ e }}</button>
+              </form>
+              {% endfor %}
+            </div>
+            {% endif %}
+          </div>
+          {% endif %}
+
+          {# ── Message actions ── #}
+          <div class="msg-actions">
+            {% if m.user_id == session.get('user_id') %}
+            <button class="btn btn-ghost btn-sm" onclick="startEdit({{ m.message_id }})">Edit</button>
+            <form method="post"
+              action="{{ url_for('delete_message', ws_id=ws_id, ch_id=ch.channel_id, msg_id=m.message_id) }}"
+              onsubmit="return confirm('Delete message?')">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" class="btn btn-ghost btn-sm" style="color:var(--danger)">Delete</button>
+            </form>
+            {% endif %}
+            {% if is_member %}
+            <form method="post"
+              action="{{ url_for('toggle_pin', ws_id=ws_id, ch_id=ch.channel_id, msg_id=m.message_id) }}">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" class="btn btn-ghost btn-sm">{% if m.message_id in pinned_ids %}📌 Unpin{% else %}📌
+                Pin{% endif %}</button>
+            </form>
+            {% endif %}
+          </div>
+
+          {% if m.user_id == session.get('user_id') %}
+          <form method="post"
+            action="{{ url_for('edit_message', ws_id=ws_id, ch_id=ch.channel_id, msg_id=m.message_id) }}"
+            id="edit-form-{{ m.message_id }}" style="display:none;margin-top:6px">
+            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+            <div style="display:flex;gap:6px">
+              <input type="text" name="content" value="{{ m.content }}" required style="flex:1"
+                id="edit-input-{{ m.message_id }}">
+              <button type="submit" class="btn btn-sm btn-primary">Save</button>
+              <button type="button" class="btn btn-sm btn-secondary" onclick="cancelEdit({{ m.message_id }})">✕</button>
+            </div>
+          </form>
+          {% endif %}
+        </div>
       </div>
+      {% endfor %}
+    </div>
     {% endif %}
   </div>
 
-  <!-- Compose bar -->
+  {# ── Compose bar ── #}
   {% if is_member %}
-    <form method="post"
-          action="{{ url_for('channel', ws_id=ws_id, ch_id=ch.channel_id) }}"
-          id="compose-form">
-      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-      <div class="compose-bar">
-        <div class="compose-inner">
-          <textarea class="compose-input"
-                    name="content"
-                    placeholder="Message #{{ ch.name }} …"
-                    rows="1"
-                    id="compose-input"
-                    required></textarea>
-          <button type="submit" class="btn btn-primary btn-sm" style="align-self:flex-end">Send</button>
-        </div>
+  <form method="post" action="{{ url_for('channel', ws_id=ws_id, ch_id=ch.channel_id) }}" enctype="multipart/form-data"
+    id="compose-form">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+    <div class="compose-bar">
+
+      {# File preview strip (shown after user picks a file) #}
+      <div id="file-preview">
+        <span style="font-size:18px" id="preview-icon">📎</span>
+        <span class="fname" id="preview-name"></span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--muted)" id="preview-size"></span>
+        <button type="button" class="btn btn-ghost btn-sm" onclick="clearFile()" title="Remove file">✕</button>
       </div>
-    </form>
-  {% else %}
-    <div style="padding:12px 24px;border-top:1px solid var(--border);color:var(--muted);font-size:13px;text-align:center">
-      You're not a member of this channel.
+
+      <div class="compose-inner">
+        {# Hidden file input triggered by paperclip button #}
+        <input type="file" name="attachment" id="file-input"
+          accept=".jpg,.jpeg,.png,.gif,.webp,.svg,.pdf,.txt,.md,.csv,.json,.py,.js,.html,.css,.sql,.zip"
+          style="display:none" onchange="handleFileSelect(this)">
+
+        <button type="button" class="btn btn-ghost btn-sm"
+          style="align-self:flex-end;font-size:18px;padding:2px 4px;opacity:.6"
+          onclick="document.getElementById('file-input').click()" title="Attach a file (max 10 MB)">📎</button>
+
+        <textarea class="compose-input" name="content" placeholder="Message #{{ ch.name }} … (Ctrl+Enter to send)"
+          rows="1" id="compose-input"></textarea>
+
+        <button type="submit" class="btn btn-primary btn-sm" style="align-self:flex-end">Send</button>
+      </div>
+      <div style="font-size:10px;color:var(--muted);margin-top:4px;padding-left:2px">
+        Allowed: images, PDF, TXT, CSV, JSON, code files, ZIP · Max 10 MB
+      </div>
     </div>
+  </form>
+  {% else %}
+  <div style="padding:12px 24px;border-top:1px solid var(--border);color:var(--muted);font-size:13px;text-align:center">
+    You're not a member of this channel.
+  </div>
   {% endif %}
 </div>
 
-<!-- Invite modal -->
+{# ── Lightbox ── #}
+<div id="lightbox" onclick="closeLightbox()">
+  <span id="lightbox-close" onclick="closeLightbox()">✕</span>
+  <img id="lightbox-img" src="" alt="Full size image">
+</div>
+
+{# ── Pinned messages modal ── #}
+{% if pinned %}
+<div class="modal-backdrop" id="modal-pins">
+  <div class="modal" style="max-width:520px">
+    <span class="modal-close" onclick="closeModal('modal-pins')">✕</span>
+    <div class="modal-title">📌 Pinned Messages</div>
+    {% for p in pinned %}
+    <div style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:10px">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">
+        <strong>{{ p.username }}</strong> · {{ p.created_at.strftime('%b %d, %H:%M') }} ·
+        <span style="color:var(--accent)">pinned by {{ p.pinned_by_name }}</span>
+      </div>
+      <div style="line-height:1.5">{{ p.content }}</div>
+      <a href="{{ url_for('channel', ws_id=ws_id, ch_id=ch.channel_id) }}#msg-{{ p.message_id }}"
+        onclick="closeModal('modal-pins')" style="font-size:12px;display:inline-block;margin-top:8px">Jump to message
+        →</a>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{# ── Invite modal ── #}
 {% if ws_members %}
 <div class="modal-backdrop" id="modal-invite">
   <div class="modal">
@@ -121,7 +426,7 @@
         <select name="invited_user_id" required>
           <option value="">— choose —</option>
           {% for m in ws_members %}
-            <option value="{{ m.user_id }}">{{ m.username }}</option>
+          <option value="{{ m.user_id }}">{{ m.username }}</option>
           {% endfor %}
         </select>
       </div>
@@ -137,13 +442,45 @@
 
 {% block scripts %}
 <script>
-  // Send with Ctrl/Cmd+Enter
+  // ── Compose ──────────────────────────────────────────────────
   document.getElementById('compose-input')?.addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter')
       document.getElementById('compose-form').submit();
-    }
   });
 
+  function handleFileSelect(input) {
+    const file = input.files[0];
+    if (!file) return;
+    const MB = 10;
+    if (file.size > MB * 1024 * 1024) {
+      alert(`File exceeds the ${MB} MB limit. Please choose a smaller file.`);
+      input.value = '';
+      return;
+    }
+    const preview = document.getElementById('file-preview');
+    document.getElementById('preview-name').textContent = file.name;
+    const kb = (file.size / 1024).toFixed(1);
+    const mb = (file.size / 1048576).toFixed(1);
+    document.getElementById('preview-size').textContent =
+      file.size >= 1048576 ? `${mb} MB` : `${kb} KB`;
+    // Pick icon based on extension
+    const ext = file.name.split('.').pop().toLowerCase();
+    const imgExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'];
+    document.getElementById('preview-icon').textContent =
+      imgExts.includes(ext) ? '🖼️' :
+        ext === 'pdf' ? '📄' :
+          ['py', 'js', 'html', 'css', 'sql'].includes(ext) ? '💻' :
+            ['csv', 'json'].includes(ext) ? '📊' :
+              ext === 'zip' ? '🗜️' : '📎';
+    preview.style.display = 'flex';
+  }
+
+  function clearFile() {
+    document.getElementById('file-input').value = '';
+    document.getElementById('file-preview').style.display = 'none';
+  }
+
+  // ── Message edit ─────────────────────────────────────────────
   function startEdit(id) {
     document.getElementById('text-' + id).style.display = 'none';
     document.getElementById('edit-form-' + id).style.display = 'block';
@@ -153,5 +490,37 @@
     document.getElementById('text-' + id).style.display = 'block';
     document.getElementById('edit-form-' + id).style.display = 'none';
   }
+
+  // ── Emoji picker ─────────────────────────────────────────────
+  function togglePicker(msgId) {
+    const picker = document.getElementById('picker-' + msgId);
+    const isOpen = picker.style.display !== 'none';
+    document.querySelectorAll('.emoji-picker').forEach(p => p.style.display = 'none');
+    if (!isOpen) picker.style.display = 'flex';
+  }
+  document.addEventListener('click', e => {
+    if (!e.target.closest('.reactions-row'))
+      document.querySelectorAll('.emoji-picker').forEach(p => p.style.display = 'none');
+  });
+
+  // ── @mention highlighting ────────────────────────────────────
+  document.querySelectorAll('.msg-content').forEach(el => {
+    el.innerHTML = el.textContent.replace(
+      /@([a-zA-Z0-9_]+)/g,
+      '<span style="color:var(--accent);font-weight:600;background:rgba(79,142,247,.12);border-radius:3px;padding:0 3px">@$1</span>'
+    );
+  });
+
+  // ── Image lightbox ───────────────────────────────────────────
+  function openLightbox(src) {
+    document.getElementById('lightbox-img').src = src;
+    document.getElementById('lightbox').classList.add('open');
+  }
+  function closeLightbox() {
+    document.getElementById('lightbox').classList.remove('open');
+  }
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeLightbox();
+  });
 </script>
 {% endblock %}

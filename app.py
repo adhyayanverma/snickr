@@ -12,21 +12,42 @@ Security measures:
 """
 
 import os
+import uuid
 import functools
 import secrets
+import mimetypes
 from contextlib import contextmanager
+from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
 from flask import (Flask, g, session, request, redirect, url_for,
-                   render_template, flash, abort)
+                   render_template, flash, abort, send_from_directory)
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+
+# ── File upload config ──────────────────────────────────────────────────────
+UPLOAD_FOLDER = Path(__file__).parent / "static" / "uploads"
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+MAX_FILE_BYTES = 10 * 1024 * 1024   # 10 MB hard limit
+ALLOWED_EXTENSIONS = {
+    # images
+    "jpg", "jpeg", "png", "gif", "webp", "svg",
+    # documents
+    "pdf", "txt", "md",
+    # data / code
+    "csv", "json", "py", "js", "html", "css", "sql",
+    # archives
+    "zip",
+}
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "svg"}
+app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_BYTES
 
 # ─────────────────────────────────────────
 # Database helpers
@@ -37,7 +58,7 @@ def get_db():
         g.db = psycopg2.connect(
             host=os.environ.get("DB_HOST", "localhost"),
             port=os.environ.get("DB_PORT", 5432),
-            dbname=os.environ.get("DB_NAME", "postgres"),
+            dbname=os.environ.get("DB_NAME", "snickr"),
             user=os.environ.get("DB_USER", "postgres"),
             password=os.environ.get("DB_PASSWORD", ""),
             cursor_factory=psycopg2.extras.RealDictCursor,
@@ -85,6 +106,37 @@ def execute(sql, params=()):
             return cur.fetchone()
         except psycopg2.ProgrammingError:
             return None
+
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def is_image(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in IMAGE_EXTENSIONS
+
+def save_upload(file_storage):
+    """Validate, sanitize, and persist an uploaded file.
+    Returns (stored_name, original_name, mime_type, size) or raises ValueError.
+    """
+    original_name = secure_filename(file_storage.filename)
+    if not original_name:
+        raise ValueError("No filename provided.")
+    if not allowed_file(original_name):
+        ext = original_name.rsplit(".", 1)[-1].lower() if "." in original_name else "?"
+        raise ValueError(f"File type '.{ext}' is not allowed.")
+
+    # Read into memory to check size (werkzeug MAX_CONTENT_LENGTH handles the hard cap)
+    data = file_storage.read()
+    if len(data) == 0:
+        raise ValueError("Uploaded file is empty.")
+
+    ext = original_name.rsplit(".", 1)[1].lower()
+    stored_name = f"{uuid.uuid4().hex}.{ext}"
+    dest = UPLOAD_FOLDER / stored_name
+    dest.write_bytes(data)
+
+    mime_type = mimetypes.guess_type(original_name)[0] or "application/octet-stream"
+    return stored_name, original_name, mime_type, len(data)
 
 
 # ─────────────────────────────────────────
@@ -142,6 +194,17 @@ def load_sidebar_data():
             WHERE invited_user_id = %s AND status = 'pending'
         """, (uid,), one=True)
         g.pending_count = row["n"] if row else 0
+
+
+def mark_channel_read(channel_id, user_id):
+    """Upsert the last-read timestamp for this user+channel."""
+    with transaction():
+        execute("""
+            INSERT INTO channel_last_read(channel_id, user_id, last_read_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (channel_id, user_id)
+            DO UPDATE SET last_read_at = NOW()
+        """, (channel_id, user_id))
 
 
 # ─────────────────────────────────────────
@@ -308,6 +371,23 @@ def workspace(ws_id):
         ORDER BY c.name
     """, (uid, ws_id))
 
+    # Unread counts: messages newer than last_read_at, excluding own messages
+    unread_rows = query("""
+        SELECT c.channel_id,
+               COUNT(m.message_id) AS unread_count
+        FROM channels c
+        JOIN channel_members cm  ON cm.channel_id = c.channel_id AND cm.user_id = %s
+        LEFT JOIN channel_last_read clr
+               ON clr.channel_id = c.channel_id AND clr.user_id = %s
+        LEFT JOIN messages m
+               ON m.channel_id = c.channel_id
+              AND m.user_id   != %s
+              AND m.created_at > COALESCE(clr.last_read_at, '1970-01-01'::timestamptz)
+        WHERE c.workspace_id = %s
+        GROUP BY c.channel_id
+    """, (uid, uid, uid, ws_id))
+    unread = {r["channel_id"]: r["unread_count"] for r in unread_rows}
+
     members = query("""
         SELECT u.user_id, u.username, wm.is_admin, wm.joined_at
         FROM workspace_members wm
@@ -318,7 +398,7 @@ def workspace(ws_id):
 
     return render_template("workspace.html",
                            ws=ws, channels=channels, members=members,
-                           is_admin=membership["is_admin"])
+                           is_admin=membership["is_admin"], unread=unread)
 
 
 @app.route("/workspace/<int:ws_id>/join_channel/<int:ch_id>", methods=["POST"])
@@ -427,12 +507,33 @@ def channel(ws_id, ch_id):
     if request.method == "POST" and is_member:
         check_csrf()
         content = request.form.get("content", "").strip()
-        if content:
+        file    = request.files.get("attachment")
+
+        # A message needs at least text OR a file
+        has_file = file and file.filename
+        if not content and not has_file:
+            flash("Message cannot be empty.", "warning")
+        else:
+            # If only a file with no text, use filename as placeholder content
+            if not content and has_file:
+                content = f"📎 {secure_filename(file.filename)}"
             try:
                 with transaction():
-                    execute("SELECT sp_post_message(%s, %s, %s)",
-                            (ch_id, uid, content))
+                    row = execute("SELECT sp_post_message(%s, %s, %s)",
+                                  (ch_id, uid, content))
+                    msg_id = row["sp_post_message"]
+
+                    if has_file:
+                        stored, original, mime, size = save_upload(file)
+                        execute("""
+                            INSERT INTO message_attachments
+                                (message_id, original_name, stored_name, mime_type, file_size_bytes)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (msg_id, original, stored, mime, size))
+
                 return redirect(url_for("channel", ws_id=ws_id, ch_id=ch_id))
+            except ValueError as e:
+                flash(str(e), "danger")
             except Exception as e:
                 flash(str(e), "danger")
 
@@ -445,6 +546,55 @@ def channel(ws_id, ch_id):
         ORDER BY m.created_at ASC
         LIMIT 200
     """, (ch_id,))
+
+    # Load attachments keyed by message_id
+    if messages:
+        msg_ids = [m["message_id"] for m in messages]
+        att_rows = query("""
+            SELECT message_id, attachment_id, original_name, stored_name,
+                   mime_type, file_size_bytes
+            FROM message_attachments
+            WHERE message_id = ANY(%s)
+        """, (msg_ids,))
+        attachments = {r["message_id"]: r for r in att_rows}
+    else:
+        attachments = {}
+
+    # Reactions grouped by message: {msg_id: [{emoji, count, reacted_by_me}]}
+    if messages:
+        msg_ids = [m["message_id"] for m in messages]
+        reaction_rows = query("""
+            SELECT message_id, emoji,
+                   COUNT(*)            AS count,
+                   bool_or(user_id = %s) AS reacted_by_me
+            FROM message_reactions
+            WHERE message_id = ANY(%s)
+            GROUP BY message_id, emoji
+            ORDER BY count DESC
+        """, (uid, msg_ids))
+        reactions = {}
+        for r in reaction_rows:
+            reactions.setdefault(r["message_id"], []).append(r)
+    else:
+        reactions = {}
+
+    # Pinned messages for this channel
+    pinned = query("""
+        SELECT m.message_id, m.content, m.created_at,
+               u.username, pm.pinned_at, pu.username AS pinned_by_name
+        FROM pinned_messages pm
+        JOIN messages m ON m.message_id = pm.message_id
+        JOIN users u    ON u.user_id    = m.user_id
+        JOIN users pu   ON pu.user_id   = pm.pinned_by
+        WHERE pm.channel_id = %s
+        ORDER BY pm.pinned_at DESC
+    """, (ch_id,))
+
+    pinned_ids = {p["message_id"] for p in pinned}
+
+    # Mark channel as read for this user
+    if is_member:
+        mark_channel_read(ch_id, uid)
 
     # Members list for invite modal
     ws_members = query("""
@@ -463,7 +613,10 @@ def channel(ws_id, ch_id):
 
     return render_template("channel.html",
                            ch=ch, messages=messages, is_member=is_member,
-                           ws_id=ws_id, ws_members=ws_members)
+                           ws_id=ws_id, ws_members=ws_members,
+                           reactions=reactions, pinned=pinned,
+                           pinned_ids=pinned_ids,
+                           attachments=attachments)
 
 
 @app.route("/workspace/<int:ws_id>/channel/<int:ch_id>/message/<int:msg_id>/delete",
@@ -643,6 +796,129 @@ def add_workspace_member(ws_id):
     except Exception as e:
         flash(str(e), "danger")
     return redirect(url_for("workspace", ws_id=ws_id))
+
+
+# ─────────────────────────────────────────
+# Routes – Attachments
+# ─────────────────────────────────────────
+
+@app.route("/uploads/<path:stored_name>")
+@login_required
+def serve_attachment(stored_name):
+    """Serve uploaded files — only accessible to logged-in users."""
+    # Prevent path traversal: stored_name must be a plain filename
+    if "/" in stored_name or "\\" in stored_name or ".." in stored_name:
+        abort(400)
+    att = query("""
+        SELECT ma.*, m.channel_id
+        FROM message_attachments ma
+        JOIN messages m ON m.message_id = ma.message_id
+        WHERE ma.stored_name = %s
+    """, (stored_name,), one=True)
+    if not att:
+        abort(404)
+    # Verify the requesting user is a member of that channel
+    if not query("SELECT 1 FROM channel_members WHERE channel_id=%s AND user_id=%s",
+                 (att["channel_id"], session["user_id"]), one=True):
+        abort(403)
+    return send_from_directory(UPLOAD_FOLDER, stored_name,
+                               download_name=att["original_name"])
+
+
+@app.route("/workspace/<int:ws_id>/channel/<int:ch_id>/attachment/<int:att_id>/delete",
+           methods=["POST"])
+@login_required
+def delete_attachment(ws_id, ch_id, att_id):
+    check_csrf()
+    uid = session["user_id"]
+    att = query("""
+        SELECT ma.stored_name, m.user_id AS msg_owner
+        FROM message_attachments ma
+        JOIN messages m ON m.message_id = ma.message_id
+        WHERE ma.attachment_id = %s AND m.channel_id = %s
+    """, (att_id, ch_id), one=True)
+    if not att:
+        abort(404)
+    if att["msg_owner"] != uid:
+        # Workspace admins can also delete
+        if not query("""SELECT 1 FROM workspace_members
+                        WHERE workspace_id=%s AND user_id=%s AND is_admin""",
+                     (ws_id, uid), one=True):
+            abort(403)
+    # Delete from DB and disk
+    with transaction():
+        execute("DELETE FROM message_attachments WHERE attachment_id=%s", (att_id,))
+    disk_path = UPLOAD_FOLDER / att["stored_name"]
+    if disk_path.exists():
+        disk_path.unlink()
+    flash("Attachment removed.", "info")
+    return redirect(url_for("channel", ws_id=ws_id, ch_id=ch_id))
+
+
+# ─────────────────────────────────────────
+# Routes – Reactions
+# ─────────────────────────────────────────
+
+ALLOWED_EMOJIS = {"👍","👎","❤️","😂","🎉","🚀","👀","🔥","✅","😮"}
+
+@app.route("/workspace/<int:ws_id>/channel/<int:ch_id>/message/<int:msg_id>/react",
+           methods=["POST"])
+@login_required
+def toggle_reaction(ws_id, ch_id, msg_id):
+    check_csrf()
+    uid   = session["user_id"]
+    emoji = request.form.get("emoji", "").strip()
+    if emoji not in ALLOWED_EMOJIS:
+        abort(400)
+    if not query("SELECT 1 FROM channel_members WHERE channel_id=%s AND user_id=%s",
+                 (ch_id, uid), one=True):
+        abort(403)
+    existing = query("""
+        SELECT 1 FROM message_reactions
+        WHERE message_id=%s AND user_id=%s AND emoji=%s
+    """, (msg_id, uid, emoji), one=True)
+    with transaction():
+        if existing:
+            execute("""
+                DELETE FROM message_reactions
+                WHERE message_id=%s AND user_id=%s AND emoji=%s
+            """, (msg_id, uid, emoji))
+        else:
+            execute("""
+                INSERT INTO message_reactions(message_id, user_id, emoji)
+                VALUES (%s, %s, %s)
+            """, (msg_id, uid, emoji))
+    return redirect(url_for("channel", ws_id=ws_id, ch_id=ch_id) + f"#msg-{msg_id}")
+
+
+# ─────────────────────────────────────────
+# Routes – Pinned messages
+# ─────────────────────────────────────────
+
+@app.route("/workspace/<int:ws_id>/channel/<int:ch_id>/message/<int:msg_id>/pin",
+           methods=["POST"])
+@login_required
+def toggle_pin(ws_id, ch_id, msg_id):
+    check_csrf()
+    uid = session["user_id"]
+    if not query("SELECT 1 FROM channel_members WHERE channel_id=%s AND user_id=%s",
+                 (ch_id, uid), one=True):
+        abort(403)
+    existing = query("""
+        SELECT 1 FROM pinned_messages WHERE channel_id=%s AND message_id=%s
+    """, (ch_id, msg_id), one=True)
+    with transaction():
+        if existing:
+            execute("DELETE FROM pinned_messages WHERE channel_id=%s AND message_id=%s",
+                    (ch_id, msg_id))
+            flash("Message unpinned.", "info")
+        else:
+            execute("""
+                INSERT INTO pinned_messages(channel_id, message_id, pinned_by)
+                VALUES (%s, %s, %s)
+            """, (ch_id, msg_id, uid))
+            flash("📌 Message pinned!", "success")
+    return redirect(url_for("channel", ws_id=ws_id, ch_id=ch_id))
 
 
 # ─────────────────────────────────────────

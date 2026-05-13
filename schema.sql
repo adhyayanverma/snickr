@@ -1,5 +1,6 @@
 -- snickr schema (CS6083 Project 2)
 -- Drop in reverse dependency order
+DROP TABLE IF EXISTS message_attachments CASCADE;
 DROP TABLE IF EXISTS messages CASCADE;
 DROP TABLE IF EXISTS channel_invitations CASCADE;
 DROP TABLE IF EXISTS channel_members CASCADE;
@@ -75,6 +76,47 @@ CREATE TABLE messages (
     edited_at  TIMESTAMPTZ
 );
 
+-- File attachments linked to a message (one message can have one attachment)
+CREATE TABLE message_attachments (
+    attachment_id   SERIAL PRIMARY KEY,
+    message_id      INTEGER       NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    original_name   VARCHAR(255)  NOT NULL,   -- original filename from user's device
+    stored_name     VARCHAR(255)  NOT NULL UNIQUE, -- uuid-based name on disk
+    mime_type       VARCHAR(100)  NOT NULL,
+    file_size_bytes INTEGER       NOT NULL,
+    uploaded_at     TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- ─────────────────────────────────────────
+-- Extra-credit feature tables
+-- ─────────────────────────────────────────
+
+-- Emoji reactions: one row per (message, user, emoji) triple
+CREATE TABLE message_reactions (
+    message_id  INTEGER      NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    user_id     INTEGER      NOT NULL REFERENCES users(user_id)       ON DELETE CASCADE,
+    emoji       VARCHAR(10)  NOT NULL,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (message_id, user_id, emoji)
+);
+
+-- Track the last time each user read each channel (drives unread badges)
+CREATE TABLE channel_last_read (
+    channel_id   INTEGER     NOT NULL REFERENCES channels(channel_id) ON DELETE CASCADE,
+    user_id      INTEGER     NOT NULL REFERENCES users(user_id)       ON DELETE CASCADE,
+    last_read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (channel_id, user_id)
+);
+
+-- Pinned messages: at most one pin record per (channel, message)
+CREATE TABLE pinned_messages (
+    channel_id  INTEGER     NOT NULL REFERENCES channels(channel_id)  ON DELETE CASCADE,
+    message_id  INTEGER     NOT NULL REFERENCES messages(message_id)  ON DELETE CASCADE,
+    pinned_by   INTEGER     NOT NULL REFERENCES users(user_id),
+    pinned_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (channel_id, message_id)
+);
+
 -- ─────────────────────────────────────────
 -- Indexes
 -- ─────────────────────────────────────────
@@ -83,6 +125,10 @@ CREATE INDEX idx_messages_user      ON messages(user_id);
 CREATE INDEX idx_messages_content   ON messages USING gin(to_tsvector('english', content));
 CREATE INDEX idx_channels_workspace ON channels(workspace_id);
 CREATE INDEX idx_wm_user            ON workspace_members(user_id);
+CREATE INDEX idx_reactions_message  ON message_reactions(message_id);
+CREATE INDEX idx_last_read_user     ON channel_last_read(user_id);
+CREATE INDEX idx_pinned_channel     ON pinned_messages(channel_id);
+CREATE INDEX idx_attachments_msg    ON message_attachments(message_id);
 
 -- ─────────────────────────────────────────
 -- Stored procedures
@@ -213,70 +259,201 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- ─────────────────────────────────────────
--- Sample data
--- ─────────────────────────────────────────
--- Passwords are bcrypt hashes of 'password123'
+-- ============================================================
+-- Sample Data  (CS6083 Project 2 — snickr)
+--
+-- Designed to exercise all 7 required SQL queries:
+--   Q1  CREATE USER          → sp_register_user / INSERT INTO users
+--   Q2  CREATE CHANNEL       → INSERT INTO channels (auth check in app)
+--   Q3  LIST ADMINS          → workspace_members WHERE is_admin = TRUE
+--   Q4  STALE INVITES        → channel_invitations WHERE created_at < NOW()-5d
+--                              AND status='pending' AND public channel
+--   Q5  CHANNEL MESSAGES     → messages WHERE channel_id = X ORDER BY created_at
+--   Q6  USER'S MESSAGES      → messages WHERE user_id = X (across channels)
+--   Q7  KEYWORD SEARCH       → messages WHERE content ILIKE '%perpendicular%'
+--                              AND user is workspace+channel member
+--
+-- IDs (all SERIAL, so determined by insert order):
+--   users       : alice=1  bob=2  carol=3  dave=4  eve=5  frank=6
+--   workspaces  : TechCorp=1  CoopBoard=2
+--   channels    : general=1  random=2  hiring=3  alice-bob-dm=4
+--                 announcements=5  maintenance=6
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- 1. USERS
+--    All passwords are werkzeug scrypt hashes of 'password123'
+--    (Q1 demo: registering a new user via the web UI calls
+--     sp_register_user, which does the same INSERT below)
+-- ------------------------------------------------------------
 INSERT INTO users (username, email, password_hash) VALUES
-('alice',   'alice@example.com',   '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj4J/HS.iK9i'),
-('bob',     'bob@example.com',     '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj4J/HS.iK9i'),
-('carol',   'carol@example.com',   '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj4J/HS.iK9i'),
-('dave',    'dave@example.com',    '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj4J/HS.iK9i'),
-('eve',     'eve@example.com',     '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj4J/HS.iK9i'),
-('frank',   'frank@example.com',   '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj4J/HS.iK9i');
+  ('alice99', 'alice@techcorp.com',  'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('bobby_b', 'bob@techcorp.com',    'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('carol_c', 'carol@example.com',   'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('dave_d',  'dave@techcorp.com',   'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('eve_e',   'eve@example.com',     'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('frank_f', 'frank@cooboard.com',  'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3');
 
-SELECT sp_create_workspace('Acme Engineering', 'Main engineering workspace', 1);  -- ws 1
-SELECT sp_create_workspace('Research Lab',     'ML and data research team',  3);  -- ws 2
 
--- Add members to workspace 1
-INSERT INTO workspace_members(workspace_id, user_id, is_admin) VALUES
-(1, 2, FALSE),(1, 4, FALSE),(1, 5, TRUE),(1, 6, FALSE);
+-- ------------------------------------------------------------
+-- 2. WORKSPACES
+--    TechCorp: company-internal engineering workspace
+--    CoopBoard: building co-op board communication
+-- ------------------------------------------------------------
+INSERT INTO workspaces (name, description, created_by) VALUES
+  ('TechCorp',  'Internal workspace for TechCorp employees', 1),  -- ws 1, created by alice
+  ('CoopBoard', 'Building co-op board communication',        2);  -- ws 2, created by bob
 
--- Add members to workspace 2
-INSERT INTO workspace_members(workspace_id, user_id, is_admin) VALUES
-(2, 1, FALSE),(2, 6, FALSE),(2, 5, FALSE);
 
--- Channels in workspace 1
-INSERT INTO channels(workspace_id, name, description, channel_type, created_by) VALUES
-(1, 'backend',   'Backend engineering',        'public',  1),
-(1, 'frontend',  'UI/UX and frontend work',    'public',  2),
-(1, 'ops',       'Infrastructure and DevOps',  'private', 4),
-(1, 'random',    'Watercooler chat',            'public',  5);
+-- ------------------------------------------------------------
+-- 3. WORKSPACE MEMBERS
+--    Q3 test: TechCorp has TWO admins (alice + bob)
+--             CoopBoard has TWO admins (bob + frank)
+--             bob is admin in BOTH workspaces — interesting case
+-- ------------------------------------------------------------
+INSERT INTO workspace_members (workspace_id, user_id, is_admin) VALUES
+  -- TechCorp
+  (1, 1, TRUE),   -- alice  (admin, creator)
+  (1, 2, TRUE),   -- bob    (admin)
+  (1, 3, FALSE),  -- carol
+  (1, 4, FALSE),  -- dave
+  (1, 5, FALSE),  -- eve
 
--- Channels in workspace 2
-INSERT INTO channels(workspace_id, name, description, channel_type, created_by) VALUES
-(2, 'papers',    'Paper discussion',           'public',  3),
-(2, 'datasets',  'Dataset sharing',            'public',  6);
+  -- CoopBoard
+  (2, 2, TRUE),   -- bob    (admin, creator)
+  (2, 6, TRUE),   -- frank  (admin)
+  (2, 5, FALSE);  -- eve    (regular member)
 
--- Channel memberships
-INSERT INTO channel_members(channel_id, user_id) VALUES
--- general (ch 1), backend (ch 2), frontend (ch 3), ops (ch 4), random (ch 5)
-(1,1),(1,2),(1,4),(1,5),(1,6),
-(2,1),(2,4),(2,6),
-(3,2),(3,5),
-(4,1),(4,4),
-(5,1),(5,2),(5,4),(5,5),(5,6),
--- ws2: general (ch 6), papers (ch 7), datasets (ch 8)
-(6,1),(6,3),(6,5),(6,6),
-(7,3),(7,6),(7,1),
-(8,3),(8,6);
 
--- Messages
-INSERT INTO messages(channel_id, user_id, content) VALUES
-(1,1,'Welcome to snickr! 🎉'),
-(1,2,'Hey everyone, glad to be here!'),
-(2,1,'Just deployed the new auth service.'),
-(2,4,'Looks good, monitoring dashboards are green.'),
-(2,6,'The latency is perpendicular to what we expected — worth investigating.'),
-(3,2,'New design system PR is up for review.'),
-(5,5,'Anyone up for lunch tomorrow?'),
-(5,2,'Absolutely, the usual spot?'),
-(6,3,'Kicking off the new research cycle.'),
-(7,3,'Has anyone read the new transformer efficiency paper?'),
-(7,6,'Yes! The results are surprisingly perpendicular to prior benchmarks.'),
-(8,3,'Uploading the cleaned MNIST variant.');
+-- ------------------------------------------------------------
+-- 4. CHANNELS
+--    TechCorp : #general (public), #random (public),
+--               #hiring (private), alice-bob-dm (direct)
+--    CoopBoard: #announcements (public), #maintenance (private)
+--
+--    Q2 test: only admins may create channels (enforced in app.py)
+--    The direct channel tests the 'direct' CHECK constraint.
+-- ------------------------------------------------------------
+INSERT INTO channels (workspace_id, name, description, channel_type, created_by) VALUES
+  (1, 'general',       'General TechCorp discussion',        'public',  1),  -- ch 1
+  (1, 'random',        'Off-topic and watercooler chat',     'public',  2),  -- ch 2
+  (1, 'hiring',        'Confidential hiring discussions',    'private', 1),  -- ch 3
+  (1, 'alice-bob-dm',  'Direct messages: Alice and Bob',     'direct',  1),  -- ch 4
+  (2, 'announcements', 'Official co-op board announcements', 'public',  2),  -- ch 5
+  (2, 'maintenance',   'Building maintenance coordination',  'private', 6);  -- ch 6
 
--- Pending invitation
-INSERT INTO channel_invitations(channel_id, invited_by, invited_user_id, status) VALUES
-(4, 1, 2, 'pending'),
-(7, 3, 5, 'pending');
+
+-- ------------------------------------------------------------
+-- 5. CHANNEL MEMBERS
+--    #random has only alice+bob joined — carol and eve were
+--    invited but have NOT accepted yet (see invitations below).
+--    This is the key setup for Q4.
+-- ------------------------------------------------------------
+INSERT INTO channel_members (channel_id, user_id) VALUES
+  -- #general (ch 1): all TechCorp members
+  (1, 1), (1, 2), (1, 3), (1, 4), (1, 5),
+
+  -- #random (ch 2): alice and bob only (carol/eve invited, not joined)
+  (2, 1), (2, 2),
+
+  -- #hiring (ch 3): alice and dave only (private)
+  (3, 1), (3, 4),
+
+  -- alice-bob-dm (ch 4): alice and bob only
+  (4, 1), (4, 2),
+
+  -- #announcements (ch 5): all CoopBoard members
+  (5, 2), (5, 5), (5, 6),
+
+  -- #maintenance (ch 6): bob and frank only (private)
+  (6, 2), (6, 6);
+
+
+-- ------------------------------------------------------------
+-- 6. CHANNEL INVITATIONS
+--
+--    Q4 test cases (public channels, invited_user NOT in channel_members):
+--      ✓ HIT  : carol → #random, invited 6 days ago, still pending
+--      ✗ MISS : eve   → #random, invited 2 days ago (< 5 days threshold)
+--
+--    Additional cases (should NOT appear in Q4):
+--      • dave → #hiring: 10 days ago but channel is PRIVATE → excluded
+--      • carol → #random accepted case below would remove from Q4 result
+--        (we keep carol pending to show the count = 1 for #random)
+-- ------------------------------------------------------------
+INSERT INTO channel_invitations (channel_id, invited_by, invited_user_id, status, created_at) VALUES
+  -- carol invited to #random by bob, 6 days ago — pending (Q4 HIT)
+  (2, 2, 3, 'pending',  NOW() - INTERVAL '6 days'),
+
+  -- eve invited to #random by alice, 2 days ago — pending (Q4 MISS: too recent)
+  (2, 1, 5, 'pending',  NOW() - INTERVAL '2 days'),
+
+  -- dave invited to #hiring by alice, 10 days ago — accepted (joined, so not pending)
+  -- This also tests that PRIVATE channels are excluded from Q4
+  (3, 1, 4, 'accepted', NOW() - INTERVAL '10 days');
+
+
+-- ------------------------------------------------------------
+-- 7. MESSAGES
+--    Column mapping (new schema):
+--      user_id  (was sender_id)
+--      content  (was body)
+--      created_at (was posted_at, now TIMESTAMPTZ with explicit value)
+--
+--    Q5 test: fetch all messages for a given channel ordered by time
+--    Q6 test: alice posts in #general, #hiring, and alice-bob-dm
+--             → her messages span 3 channels
+--    Q7 test: TWO messages contain "perpendicular"
+--      • carol's message in #general (ch 1)  — accessible to all general members
+--      • alice's message in #hiring  (ch 3)  — accessible ONLY to alice and dave
+--        carol is NOT a member of #hiring, so she must NOT see that message
+--        when her Q7 results are returned — good exclusion test case
+-- ------------------------------------------------------------
+INSERT INTO messages (channel_id, user_id, content, created_at) VALUES
+
+  -- #general (ch 1) — chronological order tests Q5
+  (1, 1, 'Welcome everyone to the TechCorp workspace!',
+      NOW() - INTERVAL '10 days'),
+  (1, 2, 'Thanks Alice — great to have a proper comms tool at last.',
+      NOW() - INTERVAL '9 days'),
+  (1, 3, 'Has anyone worked with perpendicular data structures before? Trying to model a grid graph.',
+      NOW() - INTERVAL '8 days'),   -- "perpendicular" — visible to all #general members (Q7)
+  (1, 4, 'Carol — yes! Happy to pair on that. Let us sync tomorrow.',
+      NOW() - INTERVAL '8 days'),
+  (1, 5, 'Looking forward to collaborating with everyone here.',
+      NOW() - INTERVAL '7 days'),
+  (1, 1, 'Reminder: all-hands meeting is Friday at 10 AM.',
+      NOW() - INTERVAL '3 days'),   -- alice posts twice in #general (Q6 test)
+
+  -- #random (ch 2)
+  (2, 1, 'Anyone catch the game last night?',
+      NOW() - INTERVAL '5 days'),
+  (2, 2, 'Yes! What an ending — could not believe it.',
+      NOW() - INTERVAL '5 days'),
+
+  -- #hiring (ch 3) — private; only alice and dave can see these
+  (3, 1, 'We have three strong candidates for the senior engineer role. The skill matrix is almost perpendicular to what we saw last cycle.',
+      NOW() - INTERVAL '4 days'),   -- "perpendicular" in PRIVATE channel (Q7 exclusion test)
+  (3, 4, 'Agreed — candidate B stands out clearly. Want me to schedule the final round?',
+      NOW() - INTERVAL '3 days'),
+
+  -- alice-bob-dm (ch 4) — direct
+  (4, 1, 'Bob, can you review the Q3 budget report before Friday?',
+      NOW() - INTERVAL '2 days'),
+  (4, 2, 'Sure, I will have notes to you by Thursday morning.',
+      NOW() - INTERVAL '2 days'),
+
+  -- #announcements (ch 5) — CoopBoard public
+  (5, 2, 'Board meeting is scheduled for next Monday at 7 PM in the lobby.',
+      NOW() - INTERVAL '6 days'),
+  (5, 6, 'I will send the agenda and minutes template by Sunday.',
+      NOW() - INTERVAL '5 days'),
+  (5, 5, 'Thanks Frank — see you all there.',
+      NOW() - INTERVAL '4 days'),
+
+  -- #maintenance (ch 6) — CoopBoard private
+  (6, 6, 'The boiler inspection is overdue — contractor confirmed for Thursday.',
+      NOW() - INTERVAL '3 days'),
+  (6, 2, 'Good. I will make sure the basement is accessible.',
+      NOW() - INTERVAL '2 days');
