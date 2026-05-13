@@ -3,15 +3,24 @@
 
 {% block topbar %}
 <div class="topbar">
+  {% if ch.channel_type == 'direct' and dm_partner %}
+  <div
+    style="width:28px;height:28px;border-radius:8px;background:var(--accent2);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-weight:700;font-size:13px;color:#fff;flex-shrink:0">
+    {{ dm_partner.username[0].upper() }}
+  </div>
+  <span class="topbar-title">{{ dm_partner.username }}</span>
+  <span class="chip chip-direct" style="margin-left:4px">DM</span>
+  {% else %}
   <span class="icon" style="color:var(--muted)">#</span>
   <span class="topbar-title">{{ ch.name }}</span>
   <span class="chip chip-{{ ch.channel_type }}" style="margin-left:4px">{{ ch.channel_type }}</span>
   {% if ch.description %}<span class="topbar-sub">{{ ch.description }}</span>{% endif %}
+  {% endif %}
   <div class="topbar-right">
     {% if pinned %}
     <button class="btn btn-sm btn-secondary" onclick="openModal('modal-pins')">📌 {{ pinned|length }} pinned</button>
     {% endif %}
-    {% if is_member and ws_members %}
+    {% if is_member and ws_members and ch.channel_type != 'direct' %}
     <button class="btn btn-sm btn-secondary" onclick="openModal('modal-invite')">✉ Invite</button>
     {% endif %}
     <a href="{{ url_for('workspace', ws_id=ws_id) }}" class="btn btn-sm btn-ghost">← {{ ch.workspace_name }}</a>

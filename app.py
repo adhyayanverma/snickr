@@ -157,7 +157,7 @@ def current_user():
     if "user_id" not in session:
         return None
     return query(
-        "SELECT user_id, username, email, created_at FROM users WHERE user_id = %s",
+        "SELECT user_id, username, email, nickname, created_at FROM users WHERE user_id = %s",
         (session["user_id"],), one=True
     )
 
@@ -180,7 +180,7 @@ app.jinja_env.globals["current_user"] = current_user
 
 @app.before_request
 def load_sidebar_data():
-    """Inject sidebar workspaces and pending invitation count into g."""
+    """Inject sidebar workspaces, DM channels, and pending invitation count into g."""
     uid = session.get("user_id")
     if uid:
         g.sidebar_workspaces = query("""
@@ -189,11 +189,33 @@ def load_sidebar_data():
             JOIN workspace_members wm ON wm.workspace_id = w.workspace_id AND wm.user_id = %s
             ORDER BY w.name
         """, (uid,))
+
+        # DM channels: for each direct channel the user is in, find the other person
+        g.sidebar_dms = query("""
+            SELECT c.channel_id, c.workspace_id,
+                   u.username AS partner_username,
+                   u.user_id  AS partner_id
+            FROM channels c
+            JOIN channel_members cm  ON cm.channel_id  = c.channel_id AND cm.user_id = %s
+            JOIN channel_members cm2 ON cm2.channel_id = c.channel_id AND cm2.user_id != %s
+            JOIN users u             ON u.user_id       = cm2.user_id
+            WHERE c.channel_type = 'direct'
+            ORDER BY c.channel_id DESC
+        """, (uid, uid))
+
         row = query("""
             SELECT COUNT(*) AS n FROM channel_invitations
             WHERE invited_user_id = %s AND status = 'pending'
         """, (uid,), one=True)
-        g.pending_count = row["n"] if row else 0
+        g.pending_channel_inv_count = row["n"] if row else 0
+
+        row2 = query("""
+            SELECT COUNT(*) AS n FROM workspace_invitations
+            WHERE invited_user_id = %s AND status = 'pending'
+        """, (uid,), one=True)
+        g.pending_ws_inv_count = row2["n"] if row2 else 0
+
+        g.pending_count = g.pending_channel_inv_count + g.pending_ws_inv_count
 
 
 def mark_channel_read(channel_id, user_id):
@@ -246,6 +268,7 @@ def register():
         check_csrf()
         username     = request.form.get("username", "").strip()
         email        = request.form.get("email", "").strip().lower()
+        nickname     = request.form.get("nickname", "").strip() or None
         password     = request.form.get("password", "")
         confirm      = request.form.get("confirm", "")
 
@@ -262,8 +285,8 @@ def register():
                 pw_hash = generate_password_hash(password)
                 with transaction():
                     row = execute(
-                        "SELECT sp_register_user(%s, %s, %s)",
-                        (username, email, pw_hash)
+                        "SELECT sp_register_user(%s, %s, %s, %s)",
+                        (username, email, nickname, pw_hash)
                     )
                     user_id = row["sp_register_user"]
                 session.clear()
@@ -307,10 +330,15 @@ def dashboard():
         ORDER BY w.name
     """, (uid,))
 
-    pending_count = query("""
+    ch_pending = query("""
         SELECT COUNT(*) AS n FROM channel_invitations
         WHERE invited_user_id = %s AND status = 'pending'
     """, (uid,), one=True)["n"]
+    ws_pending = query("""
+        SELECT COUNT(*) AS n FROM workspace_invitations
+        WHERE invited_user_id = %s AND status = 'pending'
+    """, (uid,), one=True)["n"]
+    pending_count = ch_pending + ws_pending
 
     return render_template("dashboard.html",
                            workspaces=workspaces,
@@ -389,16 +417,29 @@ def workspace(ws_id):
     unread = {r["channel_id"]: r["unread_count"] for r in unread_rows}
 
     members = query("""
-        SELECT u.user_id, u.username, wm.is_admin, wm.joined_at
+        SELECT u.user_id, u.username, u.nickname, wm.is_admin, wm.joined_at
         FROM workspace_members wm
         JOIN users u ON u.user_id = wm.user_id
         WHERE wm.workspace_id = %s
         ORDER BY u.username
     """, (ws_id,))
 
+    # Set of user_ids the current user already has a DM with in this workspace
+    dm_rows = query("""
+        SELECT cm2.user_id AS partner_id
+        FROM channels c
+        JOIN channel_members cm  ON cm.channel_id  = c.channel_id AND cm.user_id = %s
+        JOIN channel_members cm2 ON cm2.channel_id = c.channel_id AND cm2.user_id != %s
+        WHERE c.workspace_id = %s AND c.channel_type = 'direct'
+    """, (uid, uid, ws_id))
+    existing_dms = {r["partner_id"] for r in dm_rows}
+
+    is_owner = (ws["created_by"] == uid)
+
     return render_template("workspace.html",
                            ws=ws, channels=channels, members=members,
-                           is_admin=membership["is_admin"], unread=unread)
+                           is_admin=membership["is_admin"], is_owner=is_owner,
+                           unread=unread, existing_dms=existing_dms)
 
 
 @app.route("/workspace/<int:ws_id>/join_channel/<int:ch_id>", methods=["POST"])
@@ -477,8 +518,74 @@ def new_channel(ws_id):
 
 
 # ─────────────────────────────────────────
-# Routes – Channel / Messages
+# Routes – Direct Messages
 # ─────────────────────────────────────────
+
+@app.route("/workspace/<int:ws_id>/dm/<int:target_uid>", methods=["POST"])
+@login_required
+def start_dm(ws_id, target_uid):
+    check_csrf()
+    uid = session["user_id"]
+
+    if uid == target_uid:
+        flash("You can't DM yourself.", "warning")
+        return redirect(url_for("workspace", ws_id=ws_id))
+
+    # Both must be workspace members
+    if not query("SELECT 1 FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+                 (ws_id, uid), one=True):
+        abort(403)
+    if not query("SELECT 1 FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+                 (ws_id, target_uid), one=True):
+        abort(403)
+
+    # Check if a 2-member direct channel already exists between these two users
+    existing = query("""
+        SELECT c.channel_id
+        FROM channels c
+        JOIN channel_members cm1 ON cm1.channel_id = c.channel_id AND cm1.user_id = %s
+        JOIN channel_members cm2 ON cm2.channel_id = c.channel_id AND cm2.user_id = %s
+        WHERE c.workspace_id = %s
+          AND c.channel_type = 'direct'
+          AND (SELECT COUNT(*) FROM channel_members WHERE channel_id = c.channel_id) = 2
+        LIMIT 1
+    """, (uid, target_uid, ws_id), one=True)
+
+    if existing:
+        return redirect(url_for("channel", ws_id=ws_id, ch_id=existing["channel_id"]))
+
+    # Build a deterministic channel name so alice→bob and bob→alice share one channel
+    target = query("SELECT username FROM users WHERE user_id=%s", (target_uid,), one=True)
+    if not target:
+        abort(404)
+    me = session["username"]
+    dm_name = f"dm-{min(me, target['username'])}-{max(me, target['username'])}"
+
+    try:
+        with transaction():
+            row = execute("""
+                INSERT INTO channels(workspace_id, name, channel_type, created_by)
+                VALUES (%s, %s, 'direct', %s)
+                RETURNING channel_id
+            """, (ws_id, dm_name, uid))
+            ch_id = row["channel_id"]
+            execute("INSERT INTO channel_members(channel_id, user_id) VALUES (%s,%s)", (ch_id, uid))
+            execute("INSERT INTO channel_members(channel_id, user_id) VALUES (%s,%s)", (ch_id, target_uid))
+        return redirect(url_for("channel", ws_id=ws_id, ch_id=ch_id))
+    except psycopg2.errors.UniqueViolation:
+        # Race condition — DM was created simultaneously; find and redirect to it
+        existing = query("""
+            SELECT c.channel_id
+            FROM channels c
+            JOIN channel_members cm1 ON cm1.channel_id = c.channel_id AND cm1.user_id = %s
+            JOIN channel_members cm2 ON cm2.channel_id = c.channel_id AND cm2.user_id = %s
+            WHERE c.workspace_id = %s AND c.channel_type = 'direct'
+            LIMIT 1
+        """, (uid, target_uid, ws_id), one=True)
+        if existing:
+            return redirect(url_for("channel", ws_id=ws_id, ch_id=existing["channel_id"]))
+        flash("Could not create DM channel.", "danger")
+        return redirect(url_for("workspace", ws_id=ws_id))
 
 @app.route("/workspace/<int:ws_id>/channel/<int:ch_id>", methods=["GET", "POST"])
 @login_required
@@ -611,12 +718,25 @@ def channel(ws_id, ch_id):
         ORDER BY u.username
     """, (ws_id, ch_id, ch_id))
 
+    # For DM channels: find the other person's username for the topbar
+    dm_partner = None
+    if ch["channel_type"] == "direct":
+        partner_row = query("""
+            SELECT u.username, u.user_id
+            FROM channel_members cm
+            JOIN users u ON u.user_id = cm.user_id
+            WHERE cm.channel_id = %s AND cm.user_id != %s
+            LIMIT 1
+        """, (ch_id, uid), one=True)
+        dm_partner = partner_row
+
     return render_template("channel.html",
                            ch=ch, messages=messages, is_member=is_member,
                            ws_id=ws_id, ws_members=ws_members,
                            reactions=reactions, pinned=pinned,
                            pinned_ids=pinned_ids,
-                           attachments=attachments)
+                           attachments=attachments,
+                           dm_partner=dm_partner)
 
 
 @app.route("/workspace/<int:ws_id>/channel/<int:ch_id>/message/<int:msg_id>/delete",
@@ -751,20 +871,40 @@ def search():
 # Routes – Profile
 # ─────────────────────────────────────────
 
-@app.route("/profile")
+@app.route("/profile", methods=["GET", "POST"])
 @login_required
 def profile():
+    uid = session["user_id"]
+    if request.method == "POST":
+        check_csrf()
+        nickname = request.form.get("nickname", "").strip() or None
+        email    = request.form.get("email", "").strip().lower()
+        if not email:
+            flash("Email is required.", "danger")
+        else:
+            try:
+                with transaction():
+                    execute("""
+                        UPDATE users SET nickname = %s, email = %s
+                        WHERE user_id = %s
+                    """, (nickname, email, uid))
+                flash("Profile updated!", "success")
+            except psycopg2.errors.UniqueViolation:
+                flash("That email is already taken.", "danger")
+            except Exception as e:
+                flash(f"Update failed: {e}", "danger")
     user = current_user()
     return render_template("profile.html", user=user)
 
 
 # ─────────────────────────────────────────
-# Routes – Workspace: add member
+# Routes – Workspace: invite member
 # ─────────────────────────────────────────
 
-@app.route("/workspace/<int:ws_id>/add_member", methods=["POST"])
+@app.route("/workspace/<int:ws_id>/invite_member", methods=["POST"])
 @login_required
-def add_workspace_member(ws_id):
+def invite_workspace_member(ws_id):
+    """Admin sends a workspace invitation to a user by username."""
     check_csrf()
     uid = session["user_id"]
     # Only admins
@@ -776,23 +916,149 @@ def add_workspace_member(ws_id):
     if not user:
         flash(f"User '{username}' not found.", "danger")
         return redirect(url_for("workspace", ws_id=ws_id))
+    if user["user_id"] == uid:
+        flash("You can't invite yourself.", "warning")
+        return redirect(url_for("workspace", ws_id=ws_id))
+    # Check if already a member
+    if query("SELECT 1 FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+             (ws_id, user["user_id"]), one=True):
+        flash(f"{username} is already a member of this workspace.", "warning")
+        return redirect(url_for("workspace", ws_id=ws_id))
     try:
         with transaction():
             execute("""
-                INSERT INTO workspace_members(workspace_id, user_id)
-                VALUES (%s, %s) ON CONFLICT DO NOTHING
-            """, (ws_id, user["user_id"]))
-            # Auto-add to general channel
-            general = query("""
-                SELECT channel_id FROM channels
-                WHERE workspace_id=%s AND name='general'
-            """, (ws_id,), one=True)
-            if general:
-                execute("""
-                    INSERT INTO channel_members(channel_id, user_id)
-                    VALUES (%s, %s) ON CONFLICT DO NOTHING
-                """, (general["channel_id"], user["user_id"]))
-        flash(f"Added {username} to the workspace.", "success")
+                INSERT INTO workspace_invitations(workspace_id, invited_by, invited_user_id)
+                VALUES (%s, %s, %s)
+            """, (ws_id, uid, user["user_id"]))
+        flash(f"Invitation sent to {username}!", "success")
+    except psycopg2.errors.UniqueViolation:
+        flash(f"{username} already has a pending invitation.", "warning")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("workspace", ws_id=ws_id))
+
+
+# ─────────────────────────────────────────
+# Routes – Workspace invitations (list + respond)
+# ─────────────────────────────────────────
+
+@app.route("/workspace_invitations")
+@login_required
+def workspace_invitations():
+    uid = session["user_id"]
+    invites = query("""
+        SELECT wi.invitation_id, wi.status, wi.created_at,
+               w.workspace_id, w.name AS workspace_name, w.description,
+               u.username AS invited_by_name
+        FROM workspace_invitations wi
+        JOIN workspaces w ON w.workspace_id = wi.workspace_id
+        JOIN users u      ON u.user_id      = wi.invited_by
+        WHERE wi.invited_user_id = %s
+        ORDER BY wi.created_at DESC
+    """, (uid,))
+    return render_template("workspace_invitations.html", invites=invites)
+
+
+@app.route("/workspace_invitations/<int:inv_id>/respond", methods=["POST"])
+@login_required
+def respond_workspace_invitation(inv_id):
+    check_csrf()
+    uid    = session["user_id"]
+    accept = request.form.get("action") == "accept"
+    try:
+        with transaction():
+            execute("SELECT sp_respond_workspace_invitation(%s, %s, %s)",
+                    (inv_id, uid, accept))
+        flash("Workspace joined!" if accept else "Invitation declined.", "success" if accept else "info")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("workspace_invitations"))
+
+
+# ─────────────────────────────────────────
+# Routes – Workspace: remove member
+# ─────────────────────────────────────────
+
+@app.route("/workspace/<int:ws_id>/remove_member/<int:target_uid>", methods=["POST"])
+@login_required
+def remove_workspace_member(ws_id, target_uid):
+    """Admin removes a non-admin member from the workspace."""
+    check_csrf()
+    uid = session["user_id"]
+    # Only admins
+    if not query("SELECT 1 FROM workspace_members WHERE workspace_id=%s AND user_id=%s AND is_admin",
+                 (ws_id, uid), one=True):
+        abort(403)
+    # Cannot remove yourself
+    if target_uid == uid:
+        flash("You cannot remove yourself.", "warning")
+        return redirect(url_for("workspace", ws_id=ws_id))
+    # Cannot remove another admin
+    target_membership = query("""
+        SELECT is_admin FROM workspace_members
+        WHERE workspace_id=%s AND user_id=%s
+    """, (ws_id, target_uid), one=True)
+    if not target_membership:
+        flash("User is not a member of this workspace.", "warning")
+        return redirect(url_for("workspace", ws_id=ws_id))
+    if target_membership["is_admin"]:
+        flash("Cannot remove an admin. Demote them first.", "warning")
+        return redirect(url_for("workspace", ws_id=ws_id))
+    try:
+        with transaction():
+            # Remove from all channels in this workspace
+            execute("""
+                DELETE FROM channel_members
+                WHERE user_id = %s AND channel_id IN (
+                    SELECT channel_id FROM channels WHERE workspace_id = %s
+                )
+            """, (target_uid, ws_id))
+            # Remove from workspace
+            execute("""
+                DELETE FROM workspace_members
+                WHERE workspace_id = %s AND user_id = %s
+            """, (ws_id, target_uid))
+        target = query("SELECT username FROM users WHERE user_id=%s", (target_uid,), one=True)
+        flash(f"Removed {target['username']} from the workspace.", "success")
+    except Exception as e:
+        flash(str(e), "danger")
+    return redirect(url_for("workspace", ws_id=ws_id))
+
+
+# ─────────────────────────────────────────
+# Routes – Workspace: promote to admin
+# ─────────────────────────────────────────
+
+@app.route("/workspace/<int:ws_id>/promote/<int:target_uid>", methods=["POST"])
+@login_required
+def promote_to_admin(ws_id, target_uid):
+    """Only workspace owner (created_by) can promote members to admin."""
+    check_csrf()
+    uid = session["user_id"]
+    # Only the workspace owner can promote
+    ws = query("SELECT created_by FROM workspaces WHERE workspace_id=%s", (ws_id,), one=True)
+    if not ws or ws["created_by"] != uid:
+        flash("Only the workspace owner can promote members to admin.", "warning")
+        return redirect(url_for("workspace", ws_id=ws_id))
+    # Target must be a non-admin member
+    target_membership = query("""
+        SELECT is_admin FROM workspace_members
+        WHERE workspace_id=%s AND user_id=%s
+    """, (ws_id, target_uid), one=True)
+    if not target_membership:
+        flash("User is not a member of this workspace.", "warning")
+        return redirect(url_for("workspace", ws_id=ws_id))
+    if target_membership["is_admin"]:
+        flash("User is already an admin.", "info")
+        return redirect(url_for("workspace", ws_id=ws_id))
+    try:
+        with transaction():
+            execute("""
+                UPDATE workspace_members SET is_admin = TRUE
+                WHERE workspace_id = %s AND user_id = %s
+            """, (ws_id, target_uid))
+        target = query("SELECT username FROM users WHERE user_id=%s", (target_uid,), one=True)
+        flash(f"Promoted {target['username']} to admin!", "success")
     except Exception as e:
         flash(str(e), "danger")
     return redirect(url_for("workspace", ws_id=ws_id))

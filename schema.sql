@@ -5,6 +5,7 @@ DROP TABLE IF EXISTS messages CASCADE;
 DROP TABLE IF EXISTS channel_invitations CASCADE;
 DROP TABLE IF EXISTS channel_members CASCADE;
 DROP TABLE IF EXISTS channels CASCADE;
+DROP TABLE IF EXISTS workspace_invitations CASCADE;
 DROP TABLE IF EXISTS workspace_members CASCADE;
 DROP TABLE IF EXISTS workspaces CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
@@ -17,6 +18,7 @@ CREATE TABLE users (
     user_id       SERIAL PRIMARY KEY,
     username      VARCHAR(50)  NOT NULL UNIQUE,
     email         VARCHAR(255) NOT NULL UNIQUE,
+    nickname      VARCHAR(100),
     password_hash VARCHAR(255) NOT NULL,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -35,6 +37,18 @@ CREATE TABLE workspace_members (
     is_admin     BOOLEAN     NOT NULL DEFAULT FALSE,
     joined_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (workspace_id, user_id)
+);
+
+-- Workspace invitations: admins invite users; users accept/decline
+CREATE TABLE workspace_invitations (
+    invitation_id   SERIAL PRIMARY KEY,
+    workspace_id    INTEGER     NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    invited_by      INTEGER     NOT NULL REFERENCES users(user_id),
+    invited_user_id INTEGER     NOT NULL REFERENCES users(user_id),
+    status          VARCHAR(10) NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending','accepted','declined')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (workspace_id, invited_user_id)
 );
 
 CREATE TABLE channels (
@@ -129,6 +143,8 @@ CREATE INDEX idx_reactions_message  ON message_reactions(message_id);
 CREATE INDEX idx_last_read_user     ON channel_last_read(user_id);
 CREATE INDEX idx_pinned_channel     ON pinned_messages(channel_id);
 CREATE INDEX idx_attachments_msg    ON message_attachments(message_id);
+CREATE INDEX idx_ws_inv_user        ON workspace_invitations(invited_user_id);
+CREATE INDEX idx_ws_inv_workspace   ON workspace_invitations(workspace_id);
 
 -- ─────────────────────────────────────────
 -- Stored procedures
@@ -138,12 +154,13 @@ CREATE INDEX idx_attachments_msg    ON message_attachments(message_id);
 CREATE OR REPLACE FUNCTION sp_register_user(
     p_username      VARCHAR,
     p_email         VARCHAR,
+    p_nickname      VARCHAR,
     p_password_hash VARCHAR
 ) RETURNS INTEGER AS $$
 DECLARE v_id INTEGER;
 BEGIN
-    INSERT INTO users(username, email, password_hash)
-    VALUES (p_username, p_email, p_password_hash)
+    INSERT INTO users(username, email, nickname, password_hash)
+    VALUES (p_username, p_email, p_nickname, p_password_hash)
     RETURNING user_id INTO v_id;
     RETURN v_id;
 END;
@@ -194,7 +211,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Accept or decline an invitation
+-- Accept or decline a channel invitation
 CREATE OR REPLACE FUNCTION sp_respond_invitation(
     p_invitation_id INTEGER,
     p_user_id       INTEGER,
@@ -224,6 +241,53 @@ BEGIN
         ON CONFLICT DO NOTHING;
     ELSE
         UPDATE channel_invitations SET status = 'declined'
+        WHERE invitation_id = p_invitation_id;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Accept or decline a workspace invitation
+CREATE OR REPLACE FUNCTION sp_respond_workspace_invitation(
+    p_invitation_id INTEGER,
+    p_user_id       INTEGER,
+    p_accept        BOOLEAN
+) RETURNS VOID AS $$
+DECLARE
+    v_workspace_id INTEGER;
+    v_status       VARCHAR;
+    v_general_id   INTEGER;
+BEGIN
+    SELECT workspace_id, status INTO v_workspace_id, v_status
+    FROM workspace_invitations
+    WHERE invitation_id = p_invitation_id AND invited_user_id = p_user_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Workspace invitation not found';
+    END IF;
+    IF v_status <> 'pending' THEN
+        RAISE EXCEPTION 'Invitation already responded to';
+    END IF;
+
+    IF p_accept THEN
+        UPDATE workspace_invitations SET status = 'accepted'
+        WHERE invitation_id = p_invitation_id;
+
+        INSERT INTO workspace_members(workspace_id, user_id)
+        VALUES (v_workspace_id, p_user_id)
+        ON CONFLICT DO NOTHING;
+
+        -- Auto-join the #general channel if it exists
+        SELECT channel_id INTO v_general_id
+        FROM channels
+        WHERE workspace_id = v_workspace_id AND name = 'general';
+
+        IF FOUND THEN
+            INSERT INTO channel_members(channel_id, user_id)
+            VALUES (v_general_id, p_user_id)
+            ON CONFLICT DO NOTHING;
+        END IF;
+    ELSE
+        UPDATE workspace_invitations SET status = 'declined'
         WHERE invitation_id = p_invitation_id;
     END IF;
 END;
@@ -262,9 +326,9 @@ $$ LANGUAGE plpgsql;
 -- ============================================================
 -- Sample Data  (CS6083 Project 2 — snickr)
 --
--- Designed to exercise all 7 required SQL queries:
+-- Designed to exercise all 7 required SQL queries plus new features:
 --   Q1  CREATE USER          → sp_register_user / INSERT INTO users
---   Q2  CREATE CHANNEL       → INSERT INTO channels (auth check in app)
+--   Q2  CREATE CHANNEL       → INSERT INTO channels (any workspace member)
 --   Q3  LIST ADMINS          → workspace_members WHERE is_admin = TRUE
 --   Q4  STALE INVITES        → channel_invitations WHERE created_at < NOW()-5d
 --                              AND status='pending' AND public channel
@@ -273,11 +337,19 @@ $$ LANGUAGE plpgsql;
 --   Q7  KEYWORD SEARCH       → messages WHERE content ILIKE '%perpendicular%'
 --                              AND user is workspace+channel member
 --
+-- New features:
+--   • Registration with nickname     → users.nickname column
+--   • Editable user profiles         → UPDATE users SET nickname/email
+--   • Workspace invitations          → workspace_invitations table
+--   • Admin removes members          → DELETE FROM workspace_members
+--   • Owner promotes to admin        → UPDATE workspace_members SET is_admin
+--   • Any member creates channels    → no admin check in app
+--
 -- IDs (all SERIAL, so determined by insert order):
---   users       : alice=1  bob=2  carol=3  dave=4  eve=5  frank=6
+--   users       : alice=1  bob=2  carol=3  dave=4  eve=5  frank=6  grace=7  hank=8
 --   workspaces  : TechCorp=1  CoopBoard=2
 --   channels    : general=1  random=2  hiring=3  alice-bob-dm=4
---                 announcements=5  maintenance=6
+--                 announcements=5  maintenance=6  design=7
 -- ============================================================
 
 
@@ -286,14 +358,17 @@ $$ LANGUAGE plpgsql;
 --    All passwords are werkzeug scrypt hashes of 'password123'
 --    (Q1 demo: registering a new user via the web UI calls
 --     sp_register_user, which does the same INSERT below)
+--    Nicknames demonstrate the new registration field.
 -- ------------------------------------------------------------
-INSERT INTO users (username, email, password_hash) VALUES
-  ('alice99', 'alice@techcorp.com',  'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
-  ('bobby_b', 'bob@techcorp.com',    'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
-  ('carol_c', 'carol@example.com',   'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
-  ('dave_d',  'dave@techcorp.com',   'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
-  ('eve_e',   'eve@example.com',     'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
-  ('frank_f', 'frank@cooboard.com',  'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3');
+INSERT INTO users (username, email, nickname, password_hash) VALUES
+  ('alice99', 'alice@techcorp.com',  'Alice',   'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('bobby_b', 'bob@techcorp.com',    'Bob',     'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('carol_c', 'carol@example.com',   'Carol',   'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('dave_d',  'dave@techcorp.com',   'Dave',    'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('eve_e',   'eve@example.com',     'Eve',     'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('frank_f', 'frank@cooboard.com',  'Frank',   'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('grace_g', 'grace@techcorp.com',  'Grace',   'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3'),
+  ('hank_h',  'hank@example.com',    'Hank',    'scrypt:32768:8:1$upFXaiQq8VMJVOmf$a745fb8d63768bebcbd737c3295f138922e8ae3308afa670896e726aaa582449e5f0e27e4afeb41cd5cbd725e5dbf5493715165e196270da59d78f4981bdb3f3');
 
 
 -- ------------------------------------------------------------
@@ -314,26 +389,54 @@ INSERT INTO workspaces (name, description, created_by) VALUES
 -- ------------------------------------------------------------
 INSERT INTO workspace_members (workspace_id, user_id, is_admin) VALUES
   -- TechCorp
-  (1, 1, TRUE),   -- alice  (admin, creator)
+  (1, 1, TRUE),   -- alice  (admin, creator/owner)
   (1, 2, TRUE),   -- bob    (admin)
   (1, 3, FALSE),  -- carol
   (1, 4, FALSE),  -- dave
   (1, 5, FALSE),  -- eve
 
   -- CoopBoard
-  (2, 2, TRUE),   -- bob    (admin, creator)
+  (2, 2, TRUE),   -- bob    (admin, creator/owner)
   (2, 6, TRUE),   -- frank  (admin)
   (2, 5, FALSE);  -- eve    (regular member)
 
 
 -- ------------------------------------------------------------
--- 4. CHANNELS
+-- 4. WORKSPACE INVITATIONS
+--    Demonstrates the invite → accept/decline workflow.
+--    • grace invited to TechCorp by alice — pending (user can accept/decline)
+--    • hank invited to TechCorp by bob — pending
+--    • grace invited to CoopBoard by bob — accepted (already joined)
+--    • hank invited to CoopBoard by frank — declined
+-- ------------------------------------------------------------
+INSERT INTO workspace_invitations (workspace_id, invited_by, invited_user_id, status, created_at) VALUES
+  -- grace invited to TechCorp by alice, 3 days ago — pending
+  (1, 1, 7, 'pending',  NOW() - INTERVAL '3 days'),
+
+  -- hank invited to TechCorp by bob, 1 day ago — pending
+  (1, 2, 8, 'pending',  NOW() - INTERVAL '1 day'),
+
+  -- grace invited to CoopBoard by bob, 5 days ago — accepted
+  (2, 2, 7, 'accepted', NOW() - INTERVAL '5 days'),
+
+  -- hank invited to CoopBoard by frank, 4 days ago — declined
+  (2, 6, 8, 'declined', NOW() - INTERVAL '4 days');
+
+-- grace is already a CoopBoard member (accepted invitation above)
+INSERT INTO workspace_members (workspace_id, user_id, is_admin) VALUES
+  (2, 7, FALSE);  -- grace (accepted invite to CoopBoard)
+
+
+-- ------------------------------------------------------------
+-- 5. CHANNELS
 --    TechCorp : #general (public), #random (public),
---               #hiring (private), alice-bob-dm (direct)
+--               #hiring (private), alice-bob-dm (direct),
+--               #design (public, created by carol — non-admin)
 --    CoopBoard: #announcements (public), #maintenance (private)
 --
---    Q2 test: only admins may create channels (enforced in app.py)
+--    Q2 test: any workspace member may create channels (enforced in app.py)
 --    The direct channel tests the 'direct' CHECK constraint.
+--    #design shows that non-admin carol can create channels.
 -- ------------------------------------------------------------
 INSERT INTO channels (workspace_id, name, description, channel_type, created_by) VALUES
   (1, 'general',       'General TechCorp discussion',        'public',  1),  -- ch 1
@@ -341,11 +444,12 @@ INSERT INTO channels (workspace_id, name, description, channel_type, created_by)
   (1, 'hiring',        'Confidential hiring discussions',    'private', 1),  -- ch 3
   (1, 'alice-bob-dm',  'Direct messages: Alice and Bob',     'direct',  1),  -- ch 4
   (2, 'announcements', 'Official co-op board announcements', 'public',  2),  -- ch 5
-  (2, 'maintenance',   'Building maintenance coordination',  'private', 6);  -- ch 6
+  (2, 'maintenance',   'Building maintenance coordination',  'private', 6),  -- ch 6
+  (1, 'design',        'UI/UX design discussion',            'public',  3);  -- ch 7 (created by carol, non-admin)
 
 
 -- ------------------------------------------------------------
--- 5. CHANNEL MEMBERS
+-- 6. CHANNEL MEMBERS
 --    #random has only alice+bob joined — carol and eve were
 --    invited but have NOT accepted yet (see invitations below).
 --    This is the key setup for Q4.
@@ -364,14 +468,17 @@ INSERT INTO channel_members (channel_id, user_id) VALUES
   (4, 1), (4, 2),
 
   -- #announcements (ch 5): all CoopBoard members
-  (5, 2), (5, 5), (5, 6),
+  (5, 2), (5, 5), (5, 6), (5, 7),
 
   -- #maintenance (ch 6): bob and frank only (private)
-  (6, 2), (6, 6);
+  (6, 2), (6, 6),
+
+  -- #design (ch 7): carol (creator) and alice
+  (7, 3), (7, 1);
 
 
 -- ------------------------------------------------------------
--- 6. CHANNEL INVITATIONS
+-- 7. CHANNEL INVITATIONS
 --
 --    Q4 test cases (public channels, invited_user NOT in channel_members):
 --      ✓ HIT  : carol → #random, invited 6 days ago, still pending
@@ -395,7 +502,7 @@ INSERT INTO channel_invitations (channel_id, invited_by, invited_user_id, status
 
 
 -- ------------------------------------------------------------
--- 7. MESSAGES
+-- 8. MESSAGES
 --    Column mapping (new schema):
 --      user_id  (was sender_id)
 --      content  (was body)
@@ -456,4 +563,10 @@ INSERT INTO messages (channel_id, user_id, content, created_at) VALUES
   (6, 6, 'The boiler inspection is overdue — contractor confirmed for Thursday.',
       NOW() - INTERVAL '3 days'),
   (6, 2, 'Good. I will make sure the basement is accessible.',
-      NOW() - INTERVAL '2 days');
+      NOW() - INTERVAL '2 days'),
+
+  -- #design (ch 7) — created by carol (non-admin), TechCorp
+  (7, 3, 'I have been working on the new dashboard wireframes. Thoughts?',
+      NOW() - INTERVAL '1 day'),
+  (7, 1, 'Looks great Carol! Love the sidebar layout.',
+      NOW() - INTERVAL '12 hours');

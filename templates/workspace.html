@@ -13,19 +13,23 @@
     <span
       style="font-family:var(--mono);font-size:9px;color:var(--warning);text-transform:uppercase;letter-spacing:1px">admin</span>
     {% endif %}
+    {% if is_owner %}
+    <span
+      style="font-family:var(--mono);font-size:9px;color:var(--accent);text-transform:uppercase;letter-spacing:1px">owner</span>
+    {% endif %}
   </div>
   <div class="topbar-right">
     <a href="{{ url_for('search') }}?ws_id={{ ws.workspace_id }}" class="btn btn-sm btn-secondary">⌕ Search</a>
     {% if is_admin %}
-    <button class="btn btn-sm btn-secondary" onclick="openModal('modal-add-member')">+ Add Member</button>
-    <a href="{{ url_for('new_channel', ws_id=ws.workspace_id) }}" class="btn btn-sm btn-primary">+ Channel</a>
+    <button class="btn btn-sm btn-secondary" onclick="openModal('modal-invite-member')">+ Invite Member</button>
     {% endif %}
+    <a href="{{ url_for('new_channel', ws_id=ws.workspace_id) }}" class="btn btn-sm btn-primary">+ Channel</a>
   </div>
 </div>
 {% endblock %}
 
 {% block content %}
-<div class="page-body" style="display:grid;grid-template-columns:1fr 260px;gap:20px;height:100%">
+<div class="page-body" style="display:grid;grid-template-columns:1fr 280px;gap:20px;height:100%">
 
   <!-- Channels -->
   <div>
@@ -87,12 +91,56 @@
     {% for m in members %}
     <div class="member-row">
       <div class="avatar">{{ m.username[0].upper() }}</div>
-      <div style="overflow:hidden">
+      <div style="overflow:hidden;flex:1">
         <div style="font-family:var(--mono);font-size:12px;color:var(--muted)">@{{ m.username }}</div>
+        {% if m.nickname %}
+        <div style="font-size:11px;color:var(--text)">{{ m.nickname }}</div>
+        {% endif %}
       </div>
       {% if m.is_admin %}
-      <span style="margin-left:auto;font-family:var(--mono);font-size:9px;color:var(--warning)">ADMIN</span>
+      <span style="font-family:var(--mono);font-size:9px;color:var(--warning)">ADMIN</span>
       {% endif %}
+
+      {# Action buttons for each member #}
+      <div style="display:flex;gap:4px;align-items:center">
+        {# DM button #}
+        {% if m.user_id != session.get('user_id') %}
+        <form method="post" action="{{ url_for('start_dm', ws_id=ws.workspace_id, target_uid=m.user_id) }}">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="btn btn-ghost btn-sm"
+            style="padding:3px 7px;font-size:13px;{% if m.user_id in existing_dms %}color:var(--accent){% endif %}"
+            title="{% if m.user_id in existing_dms %}Open DM with @{{ m.username }}{% else %}Start DM with @{{ m.username }}{% endif %}">
+            💬
+          </button>
+        </form>
+        {% endif %}
+
+        {# Promote button — only workspace owner can promote non-admins #}
+        {% if is_owner and not m.is_admin and m.user_id != session.get('user_id') %}
+        <form method="post" action="{{ url_for('promote_to_admin', ws_id=ws.workspace_id, target_uid=m.user_id) }}">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="btn btn-ghost btn-sm"
+            style="padding:3px 7px;font-size:13px;color:var(--warning)"
+            title="Promote @{{ m.username }} to admin"
+            onclick="return confirm('Promote @{{ m.username }} to admin?')">
+            ⬆
+          </button>
+        </form>
+        {% endif %}
+
+        {# Remove button — admins can remove non-admin members #}
+        {% if is_admin and not m.is_admin and m.user_id != session.get('user_id') %}
+        <form method="post" action="{{ url_for('remove_workspace_member', ws_id=ws.workspace_id, target_uid=m.user_id) }}">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="btn btn-ghost btn-sm"
+            style="padding:3px 7px;font-size:13px;color:var(--danger)"
+            title="Remove @{{ m.username }} from workspace"
+            onclick="return confirm('Remove @{{ m.username }} from the workspace?')">
+            ✕
+          </button>
+        </form>
+        {% endif %}
+      </div>
     </div>
     {% endfor %}
 
@@ -105,21 +153,24 @@
   </div>
 </div>
 
-<!-- Add member modal -->
+<!-- Invite member modal -->
 {% if is_admin %}
-<div class="modal-backdrop" id="modal-add-member">
+<div class="modal-backdrop" id="modal-invite-member">
   <div class="modal">
-    <span class="modal-close" onclick="closeModal('modal-add-member')">✕</span>
-    <div class="modal-title">Add Member</div>
-    <form method="post" action="{{ url_for('add_workspace_member', ws_id=ws.workspace_id) }}">
+    <span class="modal-close" onclick="closeModal('modal-invite-member')">✕</span>
+    <div class="modal-title">Invite Member to Workspace</div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:14px">
+      The user will receive an invitation they can accept or decline.
+    </div>
+    <form method="post" action="{{ url_for('invite_workspace_member', ws_id=ws.workspace_id) }}">
       <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
       <div class="form-group">
         <label>Username</label>
         <input type="text" name="username" required placeholder="e.g. alice" autofocus>
       </div>
       <div style="display:flex;gap:8px;justify-content:flex-end">
-        <button type="button" class="btn btn-secondary" onclick="closeModal('modal-add-member')">Cancel</button>
-        <button type="submit" class="btn btn-primary">Add →</button>
+        <button type="button" class="btn btn-secondary" onclick="closeModal('modal-invite-member')">Cancel</button>
+        <button type="submit" class="btn btn-primary">Send Invitation →</button>
       </div>
     </form>
   </div>
