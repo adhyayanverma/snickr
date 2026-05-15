@@ -806,6 +806,12 @@ def invite_user(ws_id, ch_id):
     """, (ch_id, ws_id), one=True)
     if not ch:
         abort(404)
+    if not query("SELECT 1 FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+                 (ws_id, uid), one=True):
+        abort(403)
+    if not query("SELECT 1 FROM channel_members WHERE channel_id=%s AND user_id=%s",
+                 (ch_id, uid), one=True):
+        abort(403)
     if ch["channel_type"] == "direct":
         abort(403)
     if ch["channel_type"] == "private" and ch["created_by"] != uid:
@@ -813,6 +819,10 @@ def invite_user(ws_id, ch_id):
     if not query("SELECT 1 FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
                  (ws_id, invited_uid), one=True):
         abort(403)
+    if query("SELECT 1 FROM channel_members WHERE channel_id=%s AND user_id=%s",
+             (ch_id, invited_uid), one=True):
+        flash("That user is already a member of this channel.", "warning")
+        return redirect(url_for("channel", ws_id=ws_id, ch_id=ch_id))
 
     try:
         with transaction():

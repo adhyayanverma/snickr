@@ -253,6 +253,18 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'User must be a workspace member to join this channel';
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM workspace_members
+        WHERE workspace_id = v_workspace_id AND user_id = v_invited_by
+    ) THEN
+        RAISE EXCEPTION 'Inviter must be a workspace member';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM channel_members
+        WHERE channel_id = v_channel_id AND user_id = v_invited_by
+    ) THEN
+        RAISE EXCEPTION 'Inviter must be a channel member';
+    END IF;
 
     IF p_accept THEN
         UPDATE channel_invitations SET status = 'accepted'
