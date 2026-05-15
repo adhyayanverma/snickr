@@ -396,6 +396,7 @@ def workspace(ws_id):
         FROM channels c
         LEFT JOIN channel_members cm ON cm.channel_id = c.channel_id AND cm.user_id = %s
         WHERE c.workspace_id = %s
+          AND (c.channel_type = 'public' OR cm.user_id IS NOT NULL)
         ORDER BY c.name
     """, (uid, ws_id))
 
@@ -607,8 +608,11 @@ def channel(ws_id, ch_id):
 
     is_member = bool(query("SELECT 1 FROM channel_members WHERE channel_id=%s AND user_id=%s",
                            (ch_id, uid), one=True))
+    is_creator = (ch["created_by"] == uid)
 
-    if ch["channel_type"] == "private" and not is_member:
+    # Private channels and DMs are member-only. Public channels remain browsable
+    # by workspace members, but direct channels must stay limited to two users.
+    if ch["channel_type"] in ("private", "direct") and not is_member:
         abort(403)
 
     if request.method == "POST" and is_member:
@@ -736,7 +740,8 @@ def channel(ws_id, ch_id):
                            reactions=reactions, pinned=pinned,
                            pinned_ids=pinned_ids,
                            attachments=attachments,
-                           dm_partner=dm_partner)
+                           dm_partner=dm_partner,
+                           is_creator=is_creator)
 
 
 @app.route("/workspace/<int:ws_id>/channel/<int:ch_id>/message/<int:msg_id>/delete",
@@ -794,6 +799,32 @@ def invite_user(ws_id, ch_id):
     if not invited_uid:
         flash("Please select a user to invite.", "warning")
         return redirect(url_for("channel", ws_id=ws_id, ch_id=ch_id))
+
+    ch = query("""
+        SELECT channel_type, created_by
+        FROM channels
+        WHERE channel_id = %s AND workspace_id = %s
+    """, (ch_id, ws_id), one=True)
+    if not ch:
+        abort(404)
+    if not query("SELECT 1 FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+                 (ws_id, uid), one=True):
+        abort(403)
+    if not query("SELECT 1 FROM channel_members WHERE channel_id=%s AND user_id=%s",
+                 (ch_id, uid), one=True):
+        abort(403)
+    if ch["channel_type"] == "direct":
+        abort(403)
+    if ch["channel_type"] == "private" and ch["created_by"] != uid:
+        abort(403)
+    if not query("SELECT 1 FROM workspace_members WHERE workspace_id=%s AND user_id=%s",
+                 (ws_id, invited_uid), one=True):
+        abort(403)
+    if query("SELECT 1 FROM channel_members WHERE channel_id=%s AND user_id=%s",
+             (ch_id, invited_uid), one=True):
+        flash("That user is already a member of this channel.", "warning")
+        return redirect(url_for("channel", ws_id=ws_id, ch_id=ch_id))
+
     try:
         with transaction():
             execute("""

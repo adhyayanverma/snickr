@@ -1,6 +1,9 @@
 -- snickr schema (CS6083 Project 2)
 -- Drop in reverse dependency order
 DROP TABLE IF EXISTS message_attachments CASCADE;
+DROP TABLE IF EXISTS message_reactions CASCADE;
+DROP TABLE IF EXISTS pinned_messages CASCADE;
+DROP TABLE IF EXISTS channel_last_read CASCADE;
 DROP TABLE IF EXISTS messages CASCADE;
 DROP TABLE IF EXISTS channel_invitations CASCADE;
 DROP TABLE IF EXISTS channel_members CASCADE;
@@ -220,16 +223,47 @@ CREATE OR REPLACE FUNCTION sp_respond_invitation(
 DECLARE
     v_channel_id INTEGER;
     v_status     VARCHAR;
+    v_channel_type VARCHAR;
+    v_workspace_id INTEGER;
+    v_invited_by INTEGER;
+    v_created_by INTEGER;
 BEGIN
-    SELECT channel_id, status INTO v_channel_id, v_status
-    FROM channel_invitations
-    WHERE invitation_id = p_invitation_id AND invited_user_id = p_user_id;
+    SELECT ci.channel_id, ci.status, c.channel_type, c.workspace_id, ci.invited_by, c.created_by
+    INTO v_channel_id, v_status, v_channel_type, v_workspace_id, v_invited_by, v_created_by
+    FROM channel_invitations ci
+    JOIN channels c ON c.channel_id = ci.channel_id
+    WHERE ci.invitation_id = p_invitation_id
+      AND ci.invited_user_id = p_user_id;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Invitation not found';
     END IF;
     IF v_status <> 'pending' THEN
         RAISE EXCEPTION 'Invitation already responded to';
+    END IF;
+    IF v_channel_type = 'direct' THEN
+        RAISE EXCEPTION 'Direct channels cannot be joined by invitation';
+    END IF;
+    IF v_channel_type = 'private' AND v_invited_by <> v_created_by THEN
+        RAISE EXCEPTION 'Private channel invitations must be sent by the channel creator';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM workspace_members
+        WHERE workspace_id = v_workspace_id AND user_id = p_user_id
+    ) THEN
+        RAISE EXCEPTION 'User must be a workspace member to join this channel';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM workspace_members
+        WHERE workspace_id = v_workspace_id AND user_id = v_invited_by
+    ) THEN
+        RAISE EXCEPTION 'Inviter must be a workspace member';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM channel_members
+        WHERE channel_id = v_channel_id AND user_id = v_invited_by
+    ) THEN
+        RAISE EXCEPTION 'Inviter must be a channel member';
     END IF;
 
     IF p_accept THEN
@@ -313,12 +347,16 @@ BEGIN
     SELECT m.message_id, m.channel_id, c.name::VARCHAR, c.workspace_id,
            w.name::VARCHAR, u.username::VARCHAR, m.content, m.created_at
     FROM messages m
-    JOIN channels c         ON c.channel_id   = m.channel_id
-    JOIN workspaces w       ON w.workspace_id = c.workspace_id
-    JOIN users u            ON u.user_id      = m.user_id
-    JOIN channel_members cm ON cm.channel_id  = m.channel_id AND cm.user_id = p_user_id
+    JOIN channels c              ON c.channel_id   = m.channel_id
+    JOIN workspaces w            ON w.workspace_id = c.workspace_id
+    JOIN users u                 ON u.user_id      = m.user_id
+    JOIN workspace_members wm    ON wm.workspace_id = c.workspace_id
+                                  AND wm.user_id = p_user_id
+    LEFT JOIN channel_members cm ON cm.channel_id  = m.channel_id
+                                  AND cm.user_id = p_user_id
     WHERE to_tsvector('english', m.content) @@ plainto_tsquery('english', p_query)
       AND (p_workspace_id IS NULL OR c.workspace_id = p_workspace_id)
+      AND (c.channel_type = 'public' OR cm.user_id IS NOT NULL)
     ORDER BY m.created_at DESC;
 END;
 $$ LANGUAGE plpgsql;

@@ -20,7 +20,7 @@
     {% if pinned %}
     <button class="btn btn-sm btn-secondary" onclick="openModal('modal-pins')">📌 {{ pinned|length }} pinned</button>
     {% endif %}
-    {% if is_member and ws_members and ch.channel_type != 'direct' %}
+    {% if is_member and ws_members and (ch.channel_type == 'public' or (ch.channel_type == 'private' and is_creator)) %}
     <button class="btn btn-sm btn-secondary" onclick="openModal('modal-invite')">✉ Invite</button>
     {% endif %}
     <a href="{{ url_for('workspace', ws_id=ws_id) }}" class="btn btn-sm btn-ghost">← {{ ch.workspace_name }}</a>
@@ -423,7 +423,7 @@
 {% endif %}
 
 {# ── Invite modal ── #}
-{% if ws_members %}
+{% if ws_members and (ch.channel_type == 'public' or (ch.channel_type == 'private' and is_creator)) %}
 <div class="modal-backdrop" id="modal-invite">
   <div class="modal">
     <span class="modal-close" onclick="closeModal('modal-invite')">✕</span>
