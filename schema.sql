@@ -347,12 +347,16 @@ BEGIN
     SELECT m.message_id, m.channel_id, c.name::VARCHAR, c.workspace_id,
            w.name::VARCHAR, u.username::VARCHAR, m.content, m.created_at
     FROM messages m
-    JOIN channels c         ON c.channel_id   = m.channel_id
-    JOIN workspaces w       ON w.workspace_id = c.workspace_id
-    JOIN users u            ON u.user_id      = m.user_id
-    JOIN channel_members cm ON cm.channel_id  = m.channel_id AND cm.user_id = p_user_id
+    JOIN channels c              ON c.channel_id   = m.channel_id
+    JOIN workspaces w            ON w.workspace_id = c.workspace_id
+    JOIN users u                 ON u.user_id      = m.user_id
+    JOIN workspace_members wm    ON wm.workspace_id = c.workspace_id
+                                  AND wm.user_id = p_user_id
+    LEFT JOIN channel_members cm ON cm.channel_id  = m.channel_id
+                                  AND cm.user_id = p_user_id
     WHERE to_tsvector('english', m.content) @@ plainto_tsquery('english', p_query)
       AND (p_workspace_id IS NULL OR c.workspace_id = p_workspace_id)
+      AND (c.channel_type = 'public' OR cm.user_id IS NOT NULL)
     ORDER BY m.created_at DESC;
 END;
 $$ LANGUAGE plpgsql;

@@ -396,6 +396,7 @@ def workspace(ws_id):
         FROM channels c
         LEFT JOIN channel_members cm ON cm.channel_id = c.channel_id AND cm.user_id = %s
         WHERE c.workspace_id = %s
+          AND (c.channel_type = 'public' OR cm.user_id IS NOT NULL)
         ORDER BY c.name
     """, (uid, ws_id))
 
